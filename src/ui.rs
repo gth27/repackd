@@ -1179,7 +1179,8 @@ impl App {
                 self.pending = paths.iter().map(|d| update::parse(d)).collect::<Result<Vec<_>, _>>().and_then(|ups| update::ladder(&g.version, ups)).map_err(|e| format!("{e:#}"));
                 if matches!(&self.pending, Ok(u) if u.is_empty()) {
                     // all skipped as not newer: say so instead of showing nothing
-                    self.pending = Err(format!("None of them is newer than v{}. If the game's version is wrong, correct it above.", g.version));
+                    let v = if g.version.is_empty() { "the game's version".to_string() } else { format!("v{}", g.version) };
+                    self.pending = Err(format!("None of them is newer than {v}. If the game's version is wrong, correct it above."));
                 }
             }
             let has_plan = matches!(&self.pending, Ok(u) if !u.is_empty()) || self.pending.is_err();
@@ -1220,7 +1221,7 @@ impl App {
         if windows {
             section(ui, "Saves");
             ui.horizontal(|ui| {
-                if ui.add_enabled(idle && has_prefix, egui::Button::new("Back up saves")).on_hover_text("copies the game's AppData/Documents saves to ~/Games/repackd-saves; Delete does this too").clicked() {
+                if ui.add_enabled(idle && has_prefix, egui::Button::new("Back up saves")).on_hover_text("copies the game's AppData/Documents saves to .repackd-saves in the games folder; Delete does this too").clicked() {
                     self.spawn(&ctx, g.clone(), Job::BackupSaves);
                 }
                 let list = self.side(&g).saves.clone();

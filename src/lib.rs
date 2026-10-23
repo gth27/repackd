@@ -1069,11 +1069,16 @@ fn profile(g: &Game) -> PathBuf {
     g.prefix().join("drive_c/users/steamuser")
 }
 
-/// `~/Games/repackd-saves/<game>`: next to the games root, so deleting a game never deletes its backups.
+/// Folder inside a games root that holds the save backups; not a game, not trash.
+const SAVES_DIR: &str = ".repackd-saves";
+
+/// `<root>/.repackd-saves/<game>`, outside the game's own folder so deleting a game never deletes its backups.
+/// An existing legacy `<root>-saves` (`~/Games-saves`) wins, so older backups stay visible; a sibling of a
+/// moved game's root (`/mnt/disk-saves`) is often not writable, which is why new ones live inside the root.
 pub fn saves_dir(g: &Game) -> PathBuf {
     let root = g.dir.parent().unwrap_or(Path::new("."));
-    let name = format!("{}-saves", root.file_name().unwrap_or_default().to_string_lossy());
-    root.with_file_name(name).join(g.slug())
+    let legacy = root.with_file_name(format!("{}-saves", root.file_name().unwrap_or_default().to_string_lossy()));
+    if legacy.is_dir() { legacy } else { root.join(SAVES_DIR) }.join(g.slug())
 }
 
 /// Backups of this game's saves, newest first.
@@ -1904,7 +1909,7 @@ pub fn scan_known(dir: &Path, known: &[PathBuf]) -> Vec<Found> {
     // (name, is a folder) of everything directly in `d`
     let list = |d: &Path| -> Vec<(String, bool)> { std::fs::read_dir(d).into_iter().flatten().flatten().map(|e| (e.file_name().to_string_lossy().into_owned(), e.file_type().is_ok_and(|t| t.is_dir()))).collect() };
     let lower_has = |l: &[(String, bool)], f: &dyn Fn(&str) -> bool| l.iter().any(|(n, _)| f(&n.to_ascii_lowercase()));
-    let mut subs: Vec<PathBuf> = list(dir).into_iter().filter(|(_, d)| *d).map(|(n, _)| dir.join(n)).collect();
+    let mut subs: Vec<PathBuf> = list(dir).into_iter().filter(|(n, d)| *d && n != SAVES_DIR).map(|(n, _)| dir.join(n)).collect();
     subs.sort();
     let mut out = vec![];
     for sub in subs {
@@ -2740,6 +2745,16 @@ mod tests {
     }
 
     #[test]
+    fn legacy_saves_dir_wins_when_it_exists() {
+        let d = tmp("savesdir");
+        let g = Game { dir: d.join("games/g"), ..Default::default() };
+        assert_eq!(saves_dir(&g), d.join("games/.repackd-saves/g"));
+        std::fs::create_dir_all(d.join("games-saves")).unwrap();
+        assert_eq!(saves_dir(&g), d.join("games-saves/g"));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
     fn only_automatic_save_backups_are_pruned() {
         let d = tmp("prune");
         let g = Game { dir: d.join("games/nier-automata"), ..Default::default() }; // "-auto" in the game's folder
@@ -2834,7 +2849,7 @@ mod tests {
         assert!(!g.dir.exists());
         let b = backups(&g);
         assert_eq!(b.len(), 1, "delete kept a backup outside the game dir: {b:?}");
-        assert!(b[0].starts_with(d.join("games-saves/some-game")));
+        assert!(b[0].starts_with(d.join("games/.repackd-saves/some-game")));
         restore_saves(&g, &b[0]).unwrap();
         assert_eq!(std::fs::read(&save).unwrap(), b"progress");
         assert!(!cache.exists(), "caches are not backed up");

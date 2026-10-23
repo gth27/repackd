@@ -118,7 +118,7 @@ Press "Game settings" on the game page.
 4. "Remove from Steam" undoes it.
 
 ### Saves
-After you play for a minute or more, saves are backed up to `~/Games/repackd-saves/<game>`. The last 5 are kept. Press "Back up saves" in Game settings for a manual copy. Restore asks "Yes, restore". Deleting a game keeps its backups.
+After you play for a minute or more, saves are backed up to a `.repackd-saves` folder inside your games folder (older installs: `~/Games/repackd-saves`). The last 5 are kept. Press "Back up saves" in Game settings for a manual copy. Restore asks "Yes, restore". Deleting a game keeps its backups.
 
 ### Emulators
 Switch and PS4 games need an emulator you provide. Set its path in Settings ("Switch emulator", "PS4 emulator" with "Browse…"). Install the firmware and keys inside the emulator yourself. repackd only checks that the files exist. If the game says "SET UP EMULATOR", pick one in Game settings.

@@ -605,9 +605,16 @@ pub fn undo(g: &Game, log: &impl Report) -> Result<(String, String)> {
     for f in &m.added {
         let _ = std::fs::remove_file(inst.join(f));
     }
+    // dirs the update created are empty now: deepest first; remove_dir refuses a non-empty one
+    let mut dirs: Vec<PathBuf> = m.added.iter().flat_map(|f| inst.join(f).ancestors().skip(1).take_while(|p| *p != inst).map(Path::to_path_buf).collect::<Vec<_>>()).collect();
+    dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+    for d in dirs {
+        let _ = std::fs::remove_dir(d);
+    }
     // a whole-game backup knows no "added" list: files made since (saves, configs, mods) are left alone
     std::fs::remove_dir_all(&root)?;
-    log.log(format!("restored {} file(s); the game is at v{} again", m.files.len(), m.from));
+    let at = if m.from.is_empty() { "back at its earlier version".to_string() } else { format!("at v{} again", m.from) };
+    log.log(format!("restored {} file(s); the game is {at}", m.files.len()));
     Ok((m.from, m.to))
 }
 
@@ -817,6 +824,8 @@ mod tests {
         std::fs::create_dir_all(u.join("Data")).unwrap();
         std::fs::write(u.join("Data/a.pak"), b"new").unwrap();
         std::fs::write(u.join("Data/b.pak"), b"added").unwrap();
+        std::fs::create_dir_all(u.join("data")).unwrap();
+        std::fs::write(u.join("data/new.txt"), b"x").unwrap();
         apply(&g, &parse(&u).unwrap(), false, true, &|_| {}).unwrap();
         assert_eq!(std::fs::read(inst.join("Data/a.pak")).unwrap(), b"new");
         let (b, _) = last_backup(&g).unwrap();
@@ -828,6 +837,7 @@ mod tests {
         assert_eq!(undo(&g, &|_| {}).unwrap(), ("1.0".to_string(), "1.1".to_string()));
         assert_eq!(std::fs::read(inst.join("Data/a.pak")).unwrap(), b"old");
         assert!(!inst.join("Data/b.pak").exists() && last_backup(&g).is_none());
+        assert!(!inst.join("data").exists() && inst.join("Data").is_dir(), "dirs the update added go, the others stay");
         std::fs::remove_dir_all(&d).unwrap();
     }
 

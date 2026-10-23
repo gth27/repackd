@@ -1,7 +1,7 @@
 //! The window: a big-picture library in the chosen colour preset. A grid of covers, one page per game with one
 //! big button (Install / Play), and a gear on that page for every option of the game. Keyboard: arrows,
 //! Enter, Esc, F11.
-use super::{App, Job, Note};
+use super::{App, Job, Note, StorageAct, OTHER};
 use crate::{find_setup, gb, Kind, Status};
 use eframe::egui::{self, pos2, vec2, Align2, Color32, CornerRadius, FontId, Key, Rect, RichText, Sense, Stroke, StrokeKind, Ui};
 use std::path::Path;
@@ -163,8 +163,8 @@ pub(super) fn show(app: &mut App, ui: &mut Ui) {
                     if let (Some(i), true) = (app.easy_open, app.easy_gear) {
                         app.leave_settings(i);
                     }
+                    app.close_storage();
                     app.global = false;
-                    app.disk_page = false;
                     close_page(app);
                 }
             } else {
@@ -203,7 +203,7 @@ pub(super) fn show(app: &mut App, ui: &mut Ui) {
     });
     egui::CentralPanel::default().frame(egui::Frame::new().fill(C::bg()).inner_margin(egui::Margin::same(32))).show(ui, |ui| {
         if app.global {
-            return if app.disk_page { disk_usage(app, ui) } else { global_settings(app, ui) };
+            return if app.storage_page { storage(app, ui) } else { global_settings(app, ui) };
         }
         match app.easy_open.filter(|&i| i < app.lib.games.len()) {
             Some(i) if app.easy_gear => settings(app, ui, i),
@@ -290,10 +290,8 @@ fn global_settings(app: &mut App, ui: &mut Ui) {
                 app.save_settings();
             }
         });
-        if ui.button("Disk usage").on_hover_text("what every game, its game data folder (Wine prefix) and its repack take").clicked() {
-            app.disk_page = true;
-            app.disk_rows.clear();
-            app.measure_disk(app.lib.games.clone());
+        if ui.button("Storage").on_hover_text("your drives: what every game takes, move games between disks, uninstall").clicked() {
+            app.open_storage(None);
         }
 
         section(ui, "Watch folder");
@@ -435,8 +433,8 @@ fn global_settings(app: &mut App, ui: &mut Ui) {
                         app.confirm_proton = None;
                         if app.busy {
                             app.say("a job is running: wait for it before deleting a Proton".to_string());
-                        } else if let Some(g) = app.lib.games.iter().find(|g| !crate::game_pids(g).is_empty()) {
-                            app.say(format!("{} is running: close it before deleting a Proton", g.name));
+                        } else if let Some(e) = app.lib.games.iter().find_map(|g| crate::ensure_stopped(g).err()) {
+                            app.say(format!("{e} Close it before deleting a Proton."));
                         } else {
                             let tx = app.tx.clone();
                             std::thread::spawn(move || {
@@ -516,55 +514,203 @@ fn global_settings(app: &mut App, ui: &mut Ui) {
     });
 }
 
-/// Disk usage of every game (game folder, Wine prefix, repack), biggest first; sizes arrive from a thread.
-fn disk_usage(app: &mut App, ui: &mut Ui) {
+/// Storage: the drives on the left; on the right the games on the shown one, to tick for Move / Uninstall. Sizes arrive from a thread.
+fn storage(app: &mut App, ui: &mut Ui) {
     if ui.input(|i| i.key_pressed(Key::Escape)) {
-        app.disk_page = false;
+        app.close_storage();
         return;
     }
+    let ctx = ui.ctx().clone();
     ui.horizontal(|ui| {
         if ui.button("<  Back").clicked() {
-            app.disk_page = false;
+            app.close_storage();
         }
-        ui.vertical(|ui| {
-            ui.label(RichText::new("Disk usage").heading());
-            let all = app.lib.games.iter().filter_map(|g| app.disk_rows.get(&g.dir)).fold([0u64; 3], |t, s| [t[0] + s[0], t[1] + s[1], t[2] + s[2]]);
-            let done = app.lib.games.iter().all(|g| app.disk_rows.contains_key(&g.dir));
-            let t = if done { "" } else { " …" };
-            ui.label(RichText::new(format!("Total {}{t} · games {} · game data folders {} · repacks {}", gb(all.iter().sum()), gb(all[0]), gb(all[1]), gb(all[2]))).color(C::sub()));
-        });
+        ui.label(RichText::new("Storage").heading());
     });
     note_line(app, ui, None);
     ui.add_space(12.0);
-    let mut rows: Vec<crate::Game> = app.lib.games.clone();
-    rows.sort_by_key(|g| std::cmp::Reverse(app.disk_rows.get(&g.dir).map_or(0, |s| s.iter().sum::<u64>())));
+    let sel = app.storage_drive.unwrap_or(OTHER);
+    let games: Vec<usize> = (0..app.lib.games.len()).filter(|&i| app.storage_bucket(&app.lib.games[i]) == sel).collect();
+    let mut pick = None;
+    let wide = ui.available_width() > 640.0;
     egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-        for g in rows {
-            let s = app.disk_rows.get(&g.dir).copied();
+        if wide {
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| pick = pick.or(storage_drives(app, ui, sel, wide)));
+                ui.add_space(16.0);
+                ui.vertical(|ui| storage_games(app, ui, &ctx, sel, games));
+            });
+        } else {
+            pick = storage_drives(app, ui, sel, wide);
+            ui.add_space(12.0);
+            storage_games(app, ui, &ctx, sel, games);
+        }
+    });
+    if let Some(d) = pick {
+        app.storage_drive = Some(d);
+        app.storage_checked.clear(); // a selection never spans drives
+        app.storage_confirm = None;
+    }
+}
+
+/// The left side of Storage: one selectable row per drive (and "Other locations"); the clicked one.
+fn storage_drives(app: &App, ui: &mut Ui, sel: u64, wide: bool) -> Option<u64> {
+    let mut pick = None;
+    ui.set_width(if wide { 260.0 } else { ui.available_width() });
+    for d in &app.storage_drives {
+        if ui.selectable_label(sel == d.dev, RichText::new(&d.label).strong()).clicked() {
+            pick = Some(d.dev);
+        }
+        let used = d.total.saturating_sub(d.free);
+        ui.add(egui::ProgressBar::new(used as f32 / d.total.max(1) as f32).desired_height(6.0).desired_width(ui.available_width().min(240.0)));
+        ui.label(RichText::new(format!("{} free of {}", gb(d.free), gb(d.total))).color(C::sub()));
+        ui.add_space(8.0);
+    }
+    if app.lib.games.iter().any(|g| app.storage_bucket(g) == OTHER) && ui.selectable_label(sel == OTHER, RichText::new("Other locations").strong()).clicked() {
+        pick = Some(OTHER);
+    }
+    pick
+}
+
+/// The right side of Storage: the shown drive's games, the totals, and the action bar for the ticked ones.
+fn storage_games(app: &mut App, ui: &mut Ui, ctx: &egui::Context, sel: u64, mut games: Vec<usize>) {
+    let head = app.storage_drives.iter().find(|d| d.dev == sel).map_or("Other locations".to_string(), |d| format!("{} — {}", d.label, d.mount.display()));
+    ui.label(RichText::new(head).heading());
+    let size = |app: &App, i: usize| app.disk_rows.get(&app.lib.games[i].dir).copied();
+    let used: u64 = games.iter().filter_map(|&i| size(app, i)).map(|s| s.iter().sum::<u64>()).sum();
+    let t = if games.iter().all(|&i| size(app, i).is_some()) { "" } else { " …" };
+    ui.label(RichText::new(format!("{} games · {}{t} used by games on this drive", games.len(), gb(used))).color(C::sub()));
+    ui.add_space(8.0);
+    games.sort_by_key(|&i| std::cmp::Reverse(size(app, i).map_or(0, |s| s.iter().sum::<u64>())));
+    for &i in &games {
+        let s = size(app, i);
+        ui.horizontal_wrapped(|ui| {
+            let g = &app.lib.games[i];
+            let mut on = app.storage_checked.contains(&g.dir);
+            if ui.checkbox(&mut on, &g.name).changed() {
+                if on { app.storage_checked.insert(g.dir.clone()) } else { app.storage_checked.remove(&g.dir) };
+            }
+            let mut txt = s.map_or("…".to_string(), |s| gb(s[0] + s[1]));
+            if let Some(s) = s.filter(|s| s[2] > 0) {
+                txt += &format!(" + repack {}", gb(s[2]));
+            }
+            ui.label(RichText::new(txt).color(C::sub()));
+            if let Some(&e) = app.storage_index.get(&g.dir).filter(|e| split(e)) {
+                let name = app.storage_drives.iter().find(|d| Some(d.dev) == e.1).map_or("another location", |d| d.label.as_str());
+                ui.label(RichText::new(format!("prefix on {name}")).color(C::sub()));
+            }
+            if g.status != Status::Installed || s.is_none_or(|s| s[2] == 0) { // no repack folder (or not measured yet)
+                return;
+            }
+            if app.confirm_disk.as_ref() != Some(&g.dir) {
+                if ui.add_enabled(!app.busy_with(g), egui::Button::new("Delete repack")).clicked() {
+                    app.confirm_disk = Some(g.dir.clone());
+                }
+                return;
+            }
+            ui.label(RichText::new(format!("Frees {}; reinstalling and checking its files won't be possible.", gb(s.map_or(0, |s| s[2])))).color(C::err()));
+            if ui.button(RichText::new("Yes, delete the repack").color(C::err())).clicked() {
+                app.confirm_disk = None;
+                app.delete_repack_bg(g.clone(), None); // RepackGone re-measures this row
+            }
+            if ui.button("Keep it").clicked() {
+                app.confirm_disk = None;
+            }
+        });
+    }
+    let picked: Vec<usize> = games.into_iter().filter(|&i| app.storage_checked.contains(&app.lib.games[i].dir)).collect();
+    if picked.is_empty() {
+        return;
+    }
+    ui.add_space(12.0);
+    ui.separator();
+    let sizes: Option<u64> = picked.iter().map(|&i| app.disk_rows.get(&app.lib.games[i].dir).map(|s| s[0] + s[1])).sum();
+    ui.label(RichText::new(format!("{} selected · {}", picked.len(), sizes.map_or("…".to_string(), gb))).strong());
+    let idle = !picked.iter().any(|&i| app.busy_with(&app.lib.games[i]) || app.queued(&app.lib.games[i]));
+    let apart = picked.iter().any(|&i| app.storage_index.get(&app.lib.games[i].dir).is_some_and(split)); // a prefix on another drive
+    let n = picked.len();
+    let mut act = app.storage_confirm.clone();
+    match act.clone() {
+        Some(StorageAct::Move(to, files_to, name)) => {
+            let what = if files_to.is_some() { "Game files and their repackd folders move" } else { "Only repackd's folders move (prefix, launch script, art); game files stay where they are" };
+            ui.label(format!("Move {n} games to {name}? {what}; each copy is checked before the old one is deleted."));
             ui.horizontal(|ui| {
-                ui.label(RichText::new(&g.name).strong());
-                let sz = |n: Option<u64>| n.map_or("…".to_string(), gb);
-                ui.label(format!("{}  (game {} · prefix {} · repack {})", sz(s.map(|s| s.iter().sum())), sz(s.map(|s| s[0])), sz(s.map(|s| s[1])), sz(s.map(|s| s[2]))));
-                if g.status != Status::Installed || !g.repack_dir.is_dir() {
-                    return;
-                }
-                if app.confirm_disk.as_ref() != Some(&g.dir) {
-                    if ui.add_enabled(!app.busy_with(&g), egui::Button::new("Delete repack")).clicked() {
-                        app.confirm_disk = Some(g.dir.clone());
+                if ui.add_enabled(idle, egui::Button::new(RichText::new("Yes, move").color(C::err()))).clicked() {
+                    let mut refused = vec![];
+                    for &i in &picked {
+                        let g = &app.lib.games[i];
+                        if g.dir.parent() == Some(to.as_path()) && crate::files_dest(g, files_to.as_deref()).is_none() {
+                            continue; // already there (the shown drive, when only other games are apart)
+                        }
+                        match crate::move_refusal(g, &to, files_to.as_deref(), &crate::others_of(&app.lib.games, g)) {
+                            Ok(()) => app.spawn(ctx, g.clone(), Job::Move { to: to.clone(), files_to: files_to.clone() }),
+                            Err(e) => refused.push(format!("{}: {e:#}", g.name)),
+                        }
                     }
-                    return;
+                    if !refused.is_empty() {
+                        app.notify(None, format!("Not moved: {}", refused.join(" · ")), true);
+                    }
+                    app.storage_checked.clear();
+                    act = None;
                 }
-                ui.label(RichText::new(format!("Frees {}; reinstalling and checking its files won't be possible.", gb(s.map_or(0, |s| s[2])))).color(C::err()));
-                if ui.button(RichText::new("Yes, delete the repack").color(C::err())).clicked() {
-                    app.confirm_disk = None;
-                    app.delete_repack_bg(g.clone(), None); // RepackGone re-measures this row
-                }
-                if ui.button("Keep it").clicked() {
-                    app.confirm_disk = None;
+                if ui.button("Cancel").clicked() {
+                    act = None;
                 }
             });
         }
-    });
+        Some(StorageAct::Uninstall) => {
+            ui.label(RichText::new(format!("Uninstall {n} games?")).color(C::err()));
+            for &i in &picked {
+                let g = &app.lib.games[i];
+                let own = g.game_dir.as_ref().filter(|d| !d.starts_with(&g.dir));
+                let own = own.map_or(String::new(), |d| format!("{} (your game folder, deleted) + ", d.display()));
+                ui.label(format!("{}: {own}{} (repackd's folder)", g.name, g.dir.display()));
+            }
+            ui.label("Saves are backed up first. This can't be undone.");
+            ui.horizontal(|ui| {
+                if ui.add_enabled(idle, egui::Button::new(RichText::new("Yes, uninstall").color(C::err()))).clicked() {
+                    for &i in &picked {
+                        app.spawn(ctx, app.lib.games[i].clone(), Job::Delete { with_files: true }); // files_guard refusals come back as the job's error
+                    }
+                    app.storage_checked.clear();
+                    act = None;
+                }
+                if ui.button("Cancel").clicked() {
+                    act = None;
+                }
+            });
+        }
+        None => {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Move to:");
+                for d in &app.storage_drives {
+                    let why = if !idle {
+                        Some("Busy or queued")
+                    } else if d.dev == sel && !apart {
+                        Some("Shown drive")
+                    } else if !d.writable {
+                        Some("No permission")
+                    } else if sizes.is_some_and(|s| d.free < s + (1 << 30)) {
+                        Some("Not enough space")
+                    } else {
+                        None
+                    };
+                    let ok = if d.dev == sel { "Bring repackd's folder to this drive".to_string() } else { d.target.display().to_string() };
+                    let b = ui.add_enabled(why.is_none(), egui::Button::new(format!("{}  ·  {} free", d.label, gb(d.free)))).on_hover_text(why.map_or(ok, str::to_string));
+                    if b.clicked() {
+                        act = Some(StorageAct::Move(d.target.clone(), Some(crate::files_target(d)), d.label.clone()));
+                    }
+                }
+                if ui.add_enabled(idle, egui::Button::new("Other folder…").small()).clicked() && let Some(to) = rfd::FileDialog::new().set_title("Move into folder").pick_folder() {
+                    act = Some(StorageAct::Move(to.clone(), None, to.display().to_string()));
+                }
+            });
+            if ui.add_enabled(idle, egui::Button::new("Uninstall")).on_hover_text(if idle { "deletes the games' files and repackd's folders" } else { "Busy or queued" }).clicked() {
+                act = Some(StorageAct::Uninstall);
+            }
+        }
+    }
+    app.storage_confirm = act;
 }
 
 /// Every option of one game (the gear on its page), its job's progress pinned on top.
@@ -593,8 +739,18 @@ fn settings(app: &mut App, ui: &mut Ui, i: usize) {
         if app.sel != Some(i) {
             app.select(Some(i)); // per-game state of the settings view (exe list, pending updates, store id)
         }
-        app.detail(ui, i);
+        if app.busy_with(&g) && app.job_label == "Moving" {
+            ui.label(RichText::new("Moving… settings are locked until it finishes.").color(C::sub()));
+            ui.add_enabled_ui(false, |ui| app.detail(ui, i)); // an edit now would land in the old folder
+        } else {
+            app.detail(ui, i);
+        }
     });
+}
+
+/// A game whose prefix folder is on another drive than its game files.
+fn split(e: &(u64, Option<u64>)) -> bool {
+    e.1 != Some(e.0) && (e.1.is_some() || e.0 != OTHER)
 }
 
 /// The message for this page (or for the library when `game` is None), if there is one.
@@ -1018,8 +1174,8 @@ fn page(app: &mut App, ui: &mut Ui, i: usize) {
                     Primary::Play => {}
                 }
                 if matches!(primary, Primary::Play) && app.playing.contains(&g.dir) && ui.button("Stop game").on_hover_text("Closes the game and everything it left running").clicked() {
-                    let pfx = g.prefix();
-                    std::thread::spawn(move || _ = crate::kill_prefix(&pfx)); // the watcher then sees no pids and sends Played
+                    let g = g.clone();
+                    std::thread::spawn(move || _ = crate::kill_game(&g)); // the watcher then sees no pids and sends Played
                 }
                 if !g.version.is_empty() {
                     ui.label(RichText::new(format!("Version {}", g.version)).color(C::sub()));
@@ -1099,8 +1255,8 @@ fn page(app: &mut App, ui: &mut Ui, i: usize) {
                 app.fix = None;
                 match fix {
                     crate::Fix::Stop => {
-                        let pfx = g.prefix();
-                        std::thread::spawn(move || _ = crate::kill_prefix(&pfx));
+                        let g = g.clone();
+                        std::thread::spawn(move || _ = crate::kill_game(&g));
                     }
                     crate::Fix::Winetricks(v) => app.spawn(ui.ctx(), g.clone(), Job::Winetricks(vec![v.to_string()])),
                     crate::Fix::Proton(p) => {

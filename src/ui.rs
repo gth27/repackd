@@ -8,7 +8,7 @@ use crate::{check, gb, free_space, ProtonRelease, Report, install, run, settings
 use anyhow::Result;
 use eframe::egui::{self, RichText, Ui};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     process::Command,
     sync::mpsc::{channel, Receiver, Sender},
@@ -46,14 +46,12 @@ enum Ev {
     NotPlaying(PathBuf),
     /// A game was deleted: drop it from the library (by its dir).
     Removed(PathBuf),
-    /// A game's folder was moved: old dir, new dir.
-    Moved(PathBuf, PathBuf),
+    /// A game's folder was moved: old folder, new folder, and the imported game's new own folder when it moved too.
+    Moved(PathBuf, PathBuf, Option<PathBuf>),
     /// After an install: the type, game file, emulator and launch options found in what was installed.
     SetUp(PathBuf, Kind, Option<PathBuf>, Option<PathBuf>, String),
-    /// A game's disk use was measured (see `App::disk`).
-    DiskUse(PathBuf, [u64; 4]),
-    /// One game's sizes for the Disk usage page: game, prefix, repack.
-    DiskRow(PathBuf, [u64; 3]),
+    /// One game's sizes were measured (see `App::disk_rows`): game, prefix, repack, update backups.
+    DiskRow(PathBuf, [u64; 4]),
     /// Updates found for a game (by its dir): the chain to apply, or why the found ones do not chain.
     UpdatesFound(PathBuf, Result<Vec<Update>, String>),
     /// SteamGridDB search results for a game's artwork picker.
@@ -66,6 +64,20 @@ enum Ev {
     RepackGone(PathBuf, Option<PathBuf>, Result<usize, String>),
     /// The job finished: whether it worked.
     Done(bool),
+}
+
+/// The event channel's sender; every send also wakes the window (egui repaints on input only, so results would sit unseen).
+#[derive(Clone)]
+struct Tx(Sender<Ev>, std::sync::Arc<std::sync::OnceLock<egui::Context>>);
+
+impl Tx {
+    fn send(&self, ev: Ev) -> Result<(), std::sync::mpsc::SendError<Ev>> {
+        let r = self.0.send(ev);
+        if let Some(ctx) = self.1.get() {
+            ctx.request_repaint(); // threads started before the first frame find no context: that frame polls anyway
+        }
+        r
+    }
 }
 
 /// A desktop notification, when notify-send is installed.
@@ -124,6 +136,16 @@ fn row_label(ui: &mut Ui, text: &str) {
     ui.painter().text(rect.left_center(), egui::Align2::LEFT_CENTER, text, font, ui.visuals().text_color());
 }
 
+/// The Storage page's `storage_drive` for games on no listed drive.
+const OTHER: u64 = u64::MAX;
+
+/// A Storage action waiting for "Yes": move to (folder, drive name), or uninstall.
+#[derive(Clone)]
+enum StorageAct {
+    Move(PathBuf, Option<PathBuf>, String),
+    Uninstall,
+}
+
 enum Job {
     Verify,
     Install { verify: bool, unattended: bool },
@@ -138,16 +160,16 @@ enum Job {
     /// Put back the files of the newest backed-up update.
     UndoUpdate,
     /// Delete the game (saves backed up first), then drop it from the library.
-    Delete,
+    Delete { with_files: bool },
     /// Move the game's folder into this folder.
-    Move { to: PathBuf },
+    Move { to: PathBuf, files_to: Option<PathBuf> },
 }
 
 pub struct App {
     lib: Library,
     sel: Option<usize>,
     log: Vec<String>,
-    tx: Sender<Ev>,
+    tx: Tx,
     rx: Receiver<Ev>,
     busy: bool,
     /// Prefix of the running install/update/winetricks job, for Cancel.
@@ -195,10 +217,21 @@ pub struct App {
     scroll_to_emulators: bool,
     /// The global Settings page is open (top bar), and its SteamGridDB key field as typed.
     global: bool,
-    /// The Disk usage page (inside the global Settings), its measured rows by game dir, and the repack delete waiting for "Yes".
-    disk_page: bool,
-    disk_rows: HashMap<PathBuf, [u64; 3]>,
+    /// The Storage page (inside the global Settings), every measured game by dir (game, prefix, repack, update backups;
+    /// also "Show disk use"), and the repack delete waiting for "Yes".
+    storage_page: bool,
+    disk_rows: HashMap<PathBuf, [u64; 4]>,
     confirm_disk: Option<PathBuf>,
+    /// Storage: the drive shown (`OTHER` = games on no listed drive), the ticked game dirs, the drives and mounts read when
+    /// the page opened (not per frame), the action waiting for "Yes", and whether "Move…" in a game's settings opened it.
+    storage_drive: Option<u64>,
+    storage_checked: HashSet<PathBuf>,
+    storage_drives: Vec<crate::Drive>,
+    storage_mounts: Vec<(u64, PathBuf)>,
+    /// Per game dir: the drive of its game files (`OTHER`: none listed, or unmounted) and of its prefix folder; made with the drives.
+    storage_index: HashMap<PathBuf, (u64, Option<u64>)>,
+    storage_confirm: Option<StorageAct>,
+    storage_from_game: bool,
     /// An installed Proton (its path) waiting for "Yes, delete".
     confirm_proton: Option<String>,
     key_text: String,
@@ -225,15 +258,8 @@ pub struct App {
     ctx: Option<egui::Context>,
     /// The library's search text.
     search: String,
-    /// "Delete the repack" waiting for its confirmation, and the open game's disk use (dir; game, prefix,
-    /// repack, update backups) once measured.
+    /// "Delete the repack" waiting for its confirmation.
     confirm_repack: bool,
-    /// "Move to another folder" waiting for its confirmation: the picked folder.
-    confirm_move: Option<PathBuf>,
-    /// The "Move…" drive list is open, with the drives read when it opened (not per frame).
-    move_pick: bool,
-    move_drives: Vec<crate::Drive>,
-    disk: Option<(PathBuf, [u64; 4])>,
     /// Gamepad input, started with the first frame (None: not started, or no gamepad support).
     pad: Option<pad::Gamepad>,
     /// The game name as it was when its field got the cursor (to notice a rename when it loses it).
@@ -276,6 +302,7 @@ struct Side {
 impl App {
     pub fn new(lib: Library) -> Self {
         let (tx, rx) = channel();
+        let tx = Tx(tx, Default::default());
         let mut app = Self {
             no_umu: which_path("umu-run").is_none(),
             deleting_repack: Default::default(),
@@ -312,9 +339,16 @@ impl App {
             scroll_to_log: false,
             scroll_to_emulators: false,
             global: false,
-            disk_page: false,
+            storage_page: false,
             disk_rows: HashMap::new(),
             confirm_disk: None,
+            storage_drive: None,
+            storage_checked: HashSet::new(),
+            storage_drives: vec![],
+            storage_mounts: vec![],
+            storage_index: HashMap::new(),
+            storage_confirm: None,
+            storage_from_game: false,
             confirm_proton: None,
             key_text: String::new(),
             releases: None,
@@ -331,10 +365,6 @@ impl App {
             ctx: None,
             search: String::new(),
             confirm_repack: false,
-            confirm_move: None,
-            move_pick: false,
-            move_drives: vec![],
-            disk: None,
             pad: None,
             name_was: None,
             want_game: None,
@@ -518,8 +548,6 @@ impl App {
         self.confirm_delete = false;
         self.confirm_restore = None;
         self.confirm_repack = false;
-        self.confirm_move = None;
-        self.move_pick = false;
         self.pending = Ok(vec![]);
         self.exes = None;
         self.store_text = i.and_then(|i| self.lib.games.get(i)).and_then(|g| g.store_id).map(|n| n.to_string()).unwrap_or_default();
@@ -535,8 +563,6 @@ impl App {
         self.easy_gear = false;
         self.confirm_delete = false;
         self.confirm_restore = None;
-        self.confirm_move = None;
-        self.move_pick = false;
     }
 
     fn poll(&mut self) {
@@ -569,9 +595,9 @@ impl App {
                 }
                 Ev::RepackGone(dir, note, r) => {
                     self.deleting_repack.remove(&dir);
-                    self.disk = None;
                     self.disk_rows.remove(&dir);
-                    if self.disk_page && let Some(g) = self.lib.games.iter().find(|g| g.dir == dir).cloned() {
+                    if self.storage_page && let Some(g) = self.lib.games.iter().find(|g| g.dir == dir).cloned() {
+                        self.refresh_storage(); // free space changed
                         self.measure_disk(vec![g]);
                     }
                     match r {
@@ -582,7 +608,6 @@ impl App {
                 }
                 Ev::SgdbHits(dir, r) => self.sgdb_hits = Some((dir, r)),
                 Ev::UpdatesFound(dir, r) => _ = self.found.insert(dir, r),
-                Ev::DiskUse(dir, sizes) => self.disk = Some((dir, sizes)),
                 Ev::DiskRow(dir, sizes) => _ = self.disk_rows.insert(dir, sizes),
                 Ev::SetUp(dir, kind, exe, emu, args) => {
                     if let Some(g) = self.lib.games.iter_mut().find(|g| g.dir == dir) {
@@ -595,6 +620,17 @@ impl App {
                     self.save();
                     self.art.retain(|(d, _), _| *d != g.dir);
                     self.queue.retain(|(d, _)| *d != g.dir);
+                    self.disk_rows.remove(&g.dir);
+                    self.found.remove(&g.dir);
+                    if self.storage_checked.remove(&g.dir) {
+                        self.storage_confirm = None; // it named this game
+                    }
+                    if self.confirm_disk.as_ref() == Some(&g.dir) {
+                        self.confirm_disk = None;
+                    }
+                    if self.storage_page {
+                        self.refresh_storage();
+                    }
                     self.notify(None, format!("{} was removed.", g.name), false);
                     if self.easy_open == Some(i) {
                         (self.easy_open, self.easy_gear) = (None, false); // that game's page is gone
@@ -604,10 +640,13 @@ impl App {
                     self.select(self.easy_open);
                     self.want_game = Some(i.saturating_sub(1));
                 }
-                Ev::Moved(old, new) => {
+                Ev::Moved(old, new, files) => {
                     let Some(i) = self.lib.games.iter().position(|g| g.dir == old) else { continue };
                     let old_script = self.lib.games[i].launch_script();
                     self.lib.games[i].moved_to(&new);
+                    if let Some(f) = &files {
+                        self.lib.games[i].files_moved_to(f);
+                    }
                     self.art_changed(&old);
                     for (d, _) in self.queue.iter_mut().filter(|(d, _)| *d == old) {
                         *d = new.clone();
@@ -615,16 +654,20 @@ impl App {
                     if self.job_game.as_ref() == Some(&old) {
                         self.job_game = Some(new.clone()); // Done looks the game up by it
                     }
-                    (self.side, self.disk, self.exes) = (None, None, None);
+                    (self.side, self.exes) = (None, None);
                     self.found.remove(&old);
                     self.disk_rows.remove(&old);
                     self.save();
                     self.write_script(i); // also rewrites the app-menu entry (same file name)
                     let g = self.lib.games[i].clone();
+                    if self.storage_page {
+                        self.refresh_storage();
+                        self.measure_disk(vec![g.clone()]); // the Storage row was just forgotten
+                    }
                     if g.prefix().join("dosdevices").is_dir() && let Err(e) = g.map_game_drive(&|s: String| _ = self.tx.send(Ev::Log(s))) {
                         self.say(format!("error: drive R: {e:#}"));
                     }
-                    let mut text = format!("{} was moved to {}.", g.name, new.display());
+                    let mut text = if new == old { format!("Only {}'s game files were moved (to {}): its prefix stayed, see the log.", g.name, files.as_ref().map_or(new.clone(), |f| f.clone()).display()) } else { format!("{} was moved to {}.", g.name, new.display()) };
                     if let Some(vdf) = &g.steam {
                         // the entry is edited in place: its appid, artwork and play time stay
                         let r = if steam::running() {
@@ -707,7 +750,7 @@ impl App {
                     }
                     // a long job finished while the user may be elsewhere
                     if self.job_started.elapsed() > Duration::from_secs(30) && which_path("notify-send").is_some() {
-                        let what = game.map(|g| format!("{}: {}", self.job_label, g.name)).unwrap_or(self.job_label.to_string());
+                        let what = game.as_ref().map(|g| format!("{}: {}", self.job_label, g.name)).unwrap_or(self.job_label.to_string());
                         let text = if ok { format!("{what}: done") } else { format!("{what}: failed, see repackd") };
                         desktop_notify(&text);
                     }
@@ -715,7 +758,13 @@ impl App {
                     self.running = None;
                     self.progress = None;
                     self.job_game = None;
-                    (self.side, self.disk) = (None, None); // the job may have changed backups, saves, files
+                    self.side = None; // the job may have changed backups, saves, files
+                    if let Some(g) = &game {
+                        self.disk_rows.remove(&g.dir); // and sizes
+                        if self.storage_page {
+                            self.measure_disk(vec![g.clone()]);
+                        }
+                    }
                     // the next queued job, for a game that is still in the library
                     while let Some((dir, job)) = self.queue.pop_front() {
                         if self.deleting_repack.contains(&dir) && matches!(job, Job::Install { .. } | Job::Verify) {
@@ -753,12 +802,58 @@ impl App {
         }
     }
 
-    /// Measure games for the Disk usage page on a background thread, one event per game.
+    /// Open the Storage page; `game` (from its "Move…") selects its drive and ticks it.
+    pub(crate) fn open_storage(&mut self, game: Option<usize>) {
+        self.refresh_storage();
+        self.storage_checked.clear();
+        self.storage_confirm = None;
+        self.storage_from_game = game.is_some();
+        let dev = match game.and_then(|i| self.lib.games.get(i)) {
+            Some(g) => Some(self.storage_bucket(g)), // even "Other locations"
+            None => self.storage_drives.first().map(|d| d.dev),
+        };
+        self.storage_drive = dev.or(Some(OTHER));
+        if let Some(g) = game.and_then(|i| self.lib.games.get(i)) {
+            self.storage_checked.insert(g.dir.clone());
+        }
+        self.global = true;
+        self.storage_page = true;
+        // rows stay from earlier visits: Moved, Removed and RepackGone re-measure what they change
+        self.measure_disk(self.lib.games.iter().filter(|g| !self.disk_rows.contains_key(&g.dir)).cloned().collect());
+    }
+
+    /// Read the drives and where each game sits (once per change, not per frame: it stats folders).
+    fn refresh_storage(&mut self) {
+        (self.storage_drives, self.storage_mounts) = crate::drives(&self.settings.root());
+        self.storage_index = self.lib.games.iter().map(|g| {
+            let files = crate::drive_of(&g.install_dir(), &self.storage_mounts).filter(|d| self.storage_drives.iter().any(|x| x.dev == *d));
+            let gone = g.status == Status::Installed && !g.install_dir().is_dir(); // its disk is not mounted
+            (g.dir.clone(), (if gone { OTHER } else { files.unwrap_or(OTHER) }, crate::drive_of(&g.dir, &self.storage_mounts)))
+        }).collect();
+    }
+
+    /// Back from Storage to where it was opened: the app settings, or the game's settings.
+    fn close_storage(&mut self) {
+        self.storage_page = false;
+        self.storage_checked.clear();
+        self.storage_confirm = None;
+        if std::mem::take(&mut self.storage_from_game) {
+            self.global = false;
+        }
+    }
+
+    /// The listed drive holding the game's files, else `OTHER`.
+    fn storage_bucket(&self, g: &Game) -> u64 {
+        self.storage_index.get(&g.dir).map_or(OTHER, |e| e.0)
+    }
+
+    /// Measure games for the Storage page on a background thread, one event per game.
     fn measure_disk(&self, games: Vec<Game>) {
         let tx = self.tx.clone();
         std::thread::spawn(move || {
             for g in games {
-                let _ = tx.send(Ev::DiskRow(g.dir.clone(), crate::disk_sizes(&g)));
+                let [game, pfx, repack] = crate::disk_sizes(&g);
+                let _ = tx.send(Ev::DiskRow(g.dir.clone(), [game, pfx, repack, update::backups_size(&g)]));
             }
         });
     }
@@ -772,7 +867,7 @@ impl App {
         self.cancel = Default::default();
         let (tx, ctx, cancel) = (self.tx.clone(), ctx.clone(), self.cancel.clone());
         std::thread::spawn(move || {
-            let report = UiReport { tx: tx.clone(), ctx: ctx.clone(), cancel };
+            let report = UiReport { tx: tx.0.clone(), ctx: ctx.clone(), cancel };
             let r = f(&report);
             if let Err(e) = &r {
                 let _ = tx.send(Ev::Note(None, format!("{e:#}"), true));
@@ -806,15 +901,16 @@ impl App {
             Job::RunExe(_) => "Running a program",
             Job::Updates { .. } => "Updating",
             Job::UndoUpdate => "Undoing the update",
-            Job::Delete => "Deleting",
+            Job::Delete { .. } => "Deleting",
             Job::Move { .. } => "Moving",
         };
         // only Wine jobs have processes for Cancel to stop
-        self.running = (!matches!(job, Job::Verify | Job::BackupSaves | Job::RestoreSaves(_) | Job::UndoUpdate | Job::Delete | Job::Move { .. })).then(|| g.prefix());
+        self.running = (!matches!(job, Job::Verify | Job::BackupSaves | Job::RestoreSaves(_) | Job::UndoUpdate | Job::Delete { .. } | Job::Move { .. })).then(|| g.prefix());
         self.cancel = Default::default();
         let (tx, ctx, cancel, root, settings) = (self.tx.clone(), ctx.clone(), self.cancel.clone(), self.lib.root.clone(), self.settings.clone());
+        let others = crate::others_of(&self.lib.games, &g);
         std::thread::spawn(move || {
-            let report = UiReport { tx: tx.clone(), ctx: ctx.clone(), cancel };
+            let report = UiReport { tx: tx.0.clone(), ctx: ctx.clone(), cancel };
             let log = |s: String| report.log(s);
             let r: Result<()> = match job {
                 Job::Verify => match crate::checksum_file(&g) {
@@ -838,10 +934,10 @@ impl App {
                     let _ = tx.send(Ev::Status(g.dir.clone(), if r.is_ok() { Status::Installed } else { Status::Failed }));
                     r.map(|()| log(format!("installed into {}", g.install_dir().display())))
                 }),
-                Job::Delete => crate::delete_files(&root, &g).map(|()| _ = tx.send(Ev::Removed(g.dir.clone()))),
-                Job::Move { to } => crate::move_game(&g, &to, &report).map(|new| {
-                    log(format!("moved to {}", new.display()));
-                    let _ = tx.send(Ev::Moved(g.dir.clone(), new));
+                Job::Delete { with_files } => crate::delete_files(&root, &g, with_files, &others, &report).map(|()| _ = tx.send(Ev::Removed(g.dir.clone()))),
+                Job::Move { to, files_to } => crate::move_game(&g, &to, files_to.as_deref(), &others, &report).map(|(new, files)| {
+                    log(format!("moved to {}", files.as_ref().unwrap_or(&new).display()));
+                    let _ = tx.send(Ev::Moved(g.dir.clone(), new, files));
                 }),
                 Job::BackupSaves => crate::backup_saves(&g, false).map(|b| {
                     let text = match b {
@@ -868,12 +964,12 @@ impl App {
                 Job::RunExe(exe) => {
                     let mut c = g.umu();
                     c.current_dir(exe.parent().unwrap_or(&exe)).arg(&exe);
-                    run(c, &log).map(|st| log(format!("{} finished ({st})", exe.display())))
+                    run(c, g.exe.as_deref(), &log).map(|st| log(format!("{} finished ({st})", exe.display())))
                 }
                 Job::Winetricks(verbs) => {
                     let mut c = g.umu();
                     c.arg("winetricks").arg("-q").args(verbs);
-                    run(c, &log).map(|st| log(format!("winetricks finished ({st})")))
+                    run(c, g.exe.as_deref(), &log).map(|st| log(format!("winetricks finished ({st})")))
                 }
             };
             let ok = r.is_ok();
@@ -1170,8 +1266,9 @@ impl App {
                 if ui.add_enabled(idle, egui::Button::new(format!("Undo update (back to v{from})"))).on_hover_text(format!("puts the game files back as they were at v{from}")).clicked() {
                     self.spawn(&ctx, g.clone(), Job::UndoUpdate);
                 }
-                if ui.add_enabled(idle, egui::Button::new(match &self.disk { Some((d, [.., b])) if *d == g.dir && *b > 0 => format!("Delete undo copies (frees {})", gb(*b)), _ => "Delete undo copies".to_string() })).on_hover_text("frees their space; updates can't be undone after this").clicked() {
-                    (self.side, self.disk) = (None, None);
+                if ui.add_enabled(idle, egui::Button::new(match self.disk_rows.get(&g.dir) { Some([.., b]) if *b > 0 => format!("Delete undo copies (frees {})", gb(*b)), _ => "Delete undo copies".to_string() })).on_hover_text("frees their space; updates can't be undone after this").clicked() {
+                    self.side = None;
+                    self.disk_rows.remove(&g.dir);
                     match update::delete_backups(&g) {
                         Ok(()) => self.notify(Some(g.dir.clone()), "Update backups deleted.", false),
                         Err(e) => self.say(format!("error: {e:#}")),
@@ -1356,21 +1453,6 @@ impl App {
         });
 
         section(ui, "Files");
-        if let Some(to) = self.confirm_move.clone() {
-            let outside = g.game_dir.as_ref().filter(|d| !d.starts_with(&g.dir));
-            let dest = to.join(g.dir.file_name().unwrap_or_default());
-            let kept = outside.map(|d| format!(" The game folder {} stays where it is: only repackd's folder (prefix, launch script, artwork) moves.", d.display())).unwrap_or_default();
-            ui.label(format!("Move {} to {}?{kept} Don't close repackd until it is done.", g.dir.display(), dest.display()));
-            ui.horizontal(|ui| {
-                if ui.button(RichText::new("Yes, move it").color(err)).clicked() {
-                    self.confirm_move = None;
-                    self.spawn(&ctx, g.clone(), Job::Move { to });
-                }
-                if ui.button("Keep it here").clicked() {
-                    self.confirm_move = None;
-                }
-            });
-        }
         ui.horizontal(|ui| {
             // the desktop's own file manager: copy mods into the game folder there
             let mut dirs = vec![("Browse game files", g.install_dir())];
@@ -1388,66 +1470,26 @@ impl App {
                     });
                 }
             }
-            if ui.add_enabled(self.confirm_move.is_none() && !self.busy_with(&g) && !self.queued(&g), egui::Button::new("Move…")).on_hover_text("moves repackd's folder for this game (prefix, launch script, artwork, shader cache) to another disk").clicked() {
-                self.move_pick = !self.move_pick;
-                if self.move_pick {
-                    self.move_drives = crate::drives(&self.settings.root());
-                }
+            if ui.add_enabled(!self.busy_with(&g) && !self.queued(&g), egui::Button::new("Move…")).on_hover_text("opens Storage: move this game (repackd's folder and its game files) to another disk").clicked() {
+                self.open_storage(Some(i));
             }
         });
-        if self.move_pick && self.confirm_move.is_none() {
-            // only a size already measured: never computed here, on the UI thread
-            let size = self.disk_rows.get(&g.dir).map(|s| s[0] + s[1]).or_else(|| self.disk.as_ref().filter(|(d, _)| *d == g.dir).map(|(_, s)| s[0] + s[1]));
-            let here = self.move_drives.iter().filter(|d| g.dir.starts_with(&d.mount)).max_by_key(|d| d.mount.as_os_str().len()).map(|d| d.dev);
-            let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
-            let mut pick = None;
-            for d in &self.move_drives {
-                let why = if here == Some(d.dev) {
-                    Some("Current drive")
-                } else if !d.writable {
-                    Some("No permission")
-                } else if size.is_some_and(|s| d.free < s + (1 << 30)) {
-                    Some("Not enough space")
-                } else {
-                    None
-                };
-                let name = if d.target.starts_with(&home) { "Home".to_string() } else { d.mount.display().to_string() };
-                let label = format!("{name}  ·  {} free{}", gb(d.free), why.map(|w| format!("  ·  {w}")).unwrap_or_default());
-                let b = ui.add_enabled(why.is_none(), egui::Button::new(label)).on_hover_text(why.map_or_else(|| d.target.display().to_string(), str::to_string));
-                if b.clicked() {
-                    pick = Some(d.target.clone());
-                }
-            }
-            if ui.small_button("Other folder…").clicked() && let Some(to) = rfd::FileDialog::new().set_title("Move into folder").pick_folder() {
-                pick = Some(to);
-            }
-            if let Some(to) = pick {
-                match crate::move_refusal(&g, &to) {
-                    Ok(()) => (self.confirm_move, self.move_pick) = (Some(to), false),
-                    Err(e) => self.say(format!("error: cannot move {}: {e:#}", g.name)),
-                }
-            }
-        }
         if installed {
             ui.horizontal(|ui| {
-                match &self.disk {
-                    Some((d, [game, pfx, repack, backups])) if *d == g.dir => {
-                        let mut parts = vec![format!("Game {}", gb(*game)), format!("{} {}", if imported { "game data folder" } else { "game data folder (Wine prefix)" }, gb(*pfx))];
-                        if *repack > 0 {
-                            parts.push(format!("repack {}", gb(*repack)));
+                match self.disk_rows.get(&g.dir).copied() {
+                    Some([game, pfx, repack, backups]) => {
+                        let mut parts = vec![format!("Game {}", gb(game)), format!("{} {}", if imported { "game data folder" } else { "game data folder (Wine prefix)" }, gb(pfx))];
+                        if repack > 0 {
+                            parts.push(format!("repack {}", gb(repack)));
                         }
-                        if *backups > 0 {
-                            parts.push(format!("update backups {}", gb(*backups)));
+                        if backups > 0 {
+                            parts.push(format!("update backups {}", gb(backups)));
                         }
                         ui.label(RichText::new(parts.join(" · ")).color(sub));
                     }
-                    _ => {
+                    None => {
                         if ui.button("Show disk use").clicked() {
-                            let (g, tx) = (g.clone(), self.tx.clone());
-                            std::thread::spawn(move || {
-                                let [game, pfx, repack] = crate::disk_sizes(&g);
-                                let _ = tx.send(Ev::DiskUse(g.dir.clone(), [game, pfx, repack, update::backups_size(&g)]));
-                            });
+                            self.measure_disk(vec![g.clone()]);
                         }
                     }
                 }
@@ -1477,8 +1519,8 @@ impl App {
                     ui.label(format!("Shader cache: {:.0} MB", size as f64 / 1e6));
                     // Play sets no busy flag, so the running check (a /proc scan) is made on click, not every frame
                     if ui.add_enabled(size > 0 && idle, egui::Button::new("Clear shader cache")).on_hover_text("games rebuild it as they play").clicked() {
-                        if !crate::game_pids(&g).is_empty() {
-                            self.say(format!("{} is running: close it before clearing its shader cache", g.name));
+                        if let Err(e) = crate::ensure_stopped(&g) {
+                            self.say(format!("{e} Close it before clearing its shader cache."));
                         } else {
                             match std::fs::remove_dir_all(g.dir.join("shadercache")) {
                                 Ok(()) => self.say(format!("cleared the shader cache of {}", g.name)),
@@ -1499,7 +1541,7 @@ impl App {
 
         section(ui, "Install");
         if imported {
-            ui.label(RichText::new("These are your own files. repackd will not delete them.").color(sub));
+            ui.label(RichText::new("These are your own files. Remove from library keeps them; Storage → Uninstall deletes them.").color(sub));
             ui.horizontal(|ui| {
                 if windows || has_prefix {
                     let label = if has_prefix { "Redo setup" } else { "Finish setup" };
@@ -1591,7 +1633,7 @@ impl App {
                 (Some(_), _) => "Remove it from repackd? The game's own files are kept; saves are backed up first.".to_string(),
                 (None, Status::Installed) => {
                     // only a size already measured: never computed here, on the UI thread
-                    let known = self.disk_rows.get(&g.dir).map(|s| s[0] + s[1]).or_else(|| self.disk.as_ref().filter(|(d, _)| *d == g.dir).map(|(_, s)| s[0] + s[1]));
+                    let known = self.disk_rows.get(&g.dir).map(|s| s[0] + s[1]);
                     let size = known.map(|b| format!(" and free {}", gb(b))).unwrap_or_default();
                     format!("Delete the installed game{size}? Your saves are copied to a backup first. The repack folder stays. This can't be stopped once started.")
                 }
@@ -1601,7 +1643,7 @@ impl App {
             ui.horizontal(|ui| {
                 if ui.add_enabled(!self.busy_with(&g) && !self.queued(&g), egui::Button::new(RichText::new("Yes, delete").color(err))).clicked() {
                     // off the UI thread: the saves backup and a 100 GB delete take a while
-                    self.spawn(&ui.ctx().clone(), g.clone(), Job::Delete);
+                    self.spawn(&ui.ctx().clone(), g.clone(), Job::Delete { with_files: false });
                     self.confirm_delete = false;
                 }
                 if ui.button("Keep it").clicked() {
@@ -1994,6 +2036,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         if self.ctx.is_none() {
             self.ctx = Some(ui.ctx().clone());
+            let _ = self.tx.1.set(ui.ctx().clone()); // background results wake the window from now on
             self.pad = pad::start(ui.ctx().clone());
             self.start_watch(ui.ctx().clone());
         }

@@ -366,6 +366,13 @@ impl Game {
             re(p);
         }
     }
+    /// An imported game's folder (outside `dir`) was moved to `new`: `game_dir` and an `exe` under it follow.
+    pub fn files_moved_to(&mut self, new: &Path) {
+        let Some(old) = self.game_dir.replace(new.to_path_buf()) else { return };
+        if let Some(e) = self.exe.as_mut() && let Ok(r) = e.strip_prefix(&old) {
+            *e = new.join(r);
+        }
+    }
     /// repackd's own copy of the game's artwork (`cover`, `wide`, `hero`, `logo`), if fetched.
     pub fn art(&self, which: &str) -> Option<PathBuf> {
         IMAGE_EXTS.iter().map(|e| self.dir.join(format!("{which}.{e}"))).find(|p| p.is_file())
@@ -642,14 +649,6 @@ impl Library {
         Ok(self.games.len() - 1)
     }
 
-    /// Remove the game's own dir (prefix, installed files, launch script) and the game; see `delete_files`.
-    pub fn delete(&mut self, i: usize) -> Result<()> {
-        delete_files(&self.root, &self.games[i])?;
-        self.games.remove(i);
-        Ok(())
-    }
-
-
 }
 
 /// A folder name as a game name: drops "[FitGirl Repack]" tags, a trailing "+ 5 DLCs + Bonus" part and a trailing
@@ -700,15 +699,65 @@ fn mark_game(dir: &Path) {
 /// Delete a game's own dir (prefix, installed files, launch script) and its Steam shortcut, after backing up
 /// its saves; never the repack folder, and never an imported game's folder (that lives outside `dir`).
 /// Runs off the UI thread: tar and a 100 GB delete take a while.
-pub fn delete_files(root: &Path, g: &Game) -> Result<()> {
+/// With `with_files`, an imported game's own folder goes too (`files_guard`); "Remove from library" keeps it.
+pub fn delete_files(root: &Path, g: &Game, with_files: bool, others: &[PathBuf], log: &impl Report) -> Result<()> {
+    delete_files_in(root, g, with_files, &home(), &all_mountpoints(), others, log)
+}
+
+/// Every mountpoint, any filesystem: the delete guard must not walk into nfs, fuse or tmpfs mounted inside a game folder.
+fn all_mountpoints() -> Vec<(u64, PathBuf)> {
+    std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default().lines().filter_map(|l| mount_entry(l).map(|(_, dev, m)| (dev, m))).collect()
+}
+
+/// Every folder the other games use (`dir`, `game_dir`, `repack_dir`), for `files_guard`.
+pub fn others_of(games: &[Game], g: &Game) -> Vec<PathBuf> {
+    let all = games.iter().filter(|o| o.dir != g.dir).flat_map(|o| [Some(&o.dir), o.game_dir.as_ref(), Some(&o.repack_dir)]);
+    all.flatten().filter(|p| !p.as_os_str().is_empty()).cloned().collect()
+}
+
+/// The imported game's own folder (outside `g.dir`) as a canonical path, if it is safe to move or delete whole.
+/// Refuses `/`, $HOME and its parents, the games root, the folder holding `g.dir`, any mountpoint at or in it
+/// (`remove_dir_all` would walk into the mounted disk), symlinks, a folder that doesn't hold `g.exe` (or no exe set),
+/// and one holding another game's folders (`others`).
+fn files_guard(root: &Path, g: &Game, home: &Path, mounts: &[(u64, PathBuf)], others: &[PathBuf]) -> Result<Option<PathBuf>> {
+    let Some(raw) = g.game_dir.as_ref().filter(|d| !d.starts_with(&g.dir)) else { return Ok(None) };
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let no = |why: &str| anyhow::anyhow!("refusing to touch the game folder {}: {why}", raw.display());
+    if !raw.is_absolute() || raw.components().any(|c| c == std::path::Component::ParentDir) {
+        return Err(no("not a plain absolute path"));
+    }
+    if raw.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(no("it is a symlink"));
+    }
+    let dir = raw.canonicalize().map_err(|e| no(&format!("cannot resolve it ({e})")))?;
+    if dir.parent().is_none() || home.starts_with(&dir) || canon(home).starts_with(&dir) {
+        return Err(no("it is / or holds your home folder"));
+    }
+    if [root, g.dir.parent().unwrap_or(root), &g.dir].iter().any(|p| canon(p).starts_with(&dir)) {
+        return Err(no("it holds repackd's games folder"));
+    }
+    if mounts.iter().any(|(_, m)| m.starts_with(&dir)) {
+        return Err(no("it is or contains a mountpoint"));
+    }
+    // without the program a parent folder holding many games would pass
+    let Some(e) = &g.exe else { return Err(no("pick the game's program (Game file) first")) };
+    if !canon(e).starts_with(&dir) {
+        return Err(no("the game's program is not inside it"));
+    }
+    if let Some(o) = others.iter().find(|o| canon(o).starts_with(&dir)) {
+        return Err(no(&format!("it holds another game's files ({})", o.display())));
+    }
+    Ok(Some(dir))
+}
+
+fn delete_files_in(root: &Path, g: &Game, with_files: bool, home: &Path, mounts: &[(u64, PathBuf)], others: &[PathBuf], log: &impl Report) -> Result<()> {
     // guard against a hand-edited library.json pointing somewhere else; checked before anything changes
     // a game outside the root (moved, or from an old root) says so with a marker
     if !(g.dir.starts_with(root) || g.dir.join(MOVED_MARK).is_file()) || g.dir == root || g.dir.components().any(|c| c == std::path::Component::ParentDir) {
         bail!("refusing to delete {}: not inside {}", g.dir.display(), root.display());
     }
-    if !game_pids(g).is_empty() {
-        bail!("{} is running (game, installer or tool). Close it, or press Stop game on its page.", g.name);
-    }
+    let files = if with_files { files_guard(root, g, home, mounts, others)? } else { None };
+    ensure_stopped(g)?;
     if g.steam.is_some() && steam::running() {
         bail!("close Steam first: this game has a Steam shortcut to remove");
     }
@@ -725,18 +774,33 @@ pub fn delete_files(root: &Path, g: &Game) -> Result<()> {
             steam::remove_art(vdf, id);
         }
     }
+    if let Some(dir) = files {
+        // beside the folder (same filesystem), and never over something of the user's that has the name
+        let trash = dir.with_file_name(format!(".trash-{}", dir.file_name().unwrap_or_default().to_string_lossy()));
+        if trash.symlink_metadata().is_ok() {
+            bail!("{} exists: remove it first", trash.display());
+        }
+        std::fs::rename(&dir, &trash).with_context(|| format!("move {} aside", dir.display()))?;
+        // past the rename the folder is gone for the user: a failed delete leaves trash (cleared at the next start), not an error
+        if let Err(e) = std::fs::remove_dir_all(&trash) {
+            log.log(format!("the game folder is moved aside, but {} could not be fully deleted: {e}", trash.display()));
+        }
+    }
     if g.dir.exists() {
         // renamed first (instant): a delete stopped half-way leaves a ".trash-" folder, cleared at the next start
         // beside the game when it is outside the root: the rename stays on its filesystem
         let trash = if g.dir.starts_with(root) { root } else { g.dir.parent().unwrap_or(root) }.join(format!(".trash-{}", g.slug()));
         let _ = std::fs::remove_dir_all(&trash);
         std::fs::rename(&g.dir, &trash).with_context(|| format!("move {} aside", g.dir.display()))?;
-        std::fs::remove_dir_all(&trash).with_context(|| format!("delete {}", trash.display()))?;
+        if let Err(e) = std::fs::remove_dir_all(&trash) {
+            log.log(format!("the game is removed, but {} could not be fully deleted: {e}", trash.display()));
+        }
     }
     Ok(())
 }
 
-/// Remove what a delete stopped half-way left behind in the games root and beside every game (old roots).
+/// Remove what a delete stopped half-way left behind in the games root and beside every game (old roots), and
+/// beside an imported game's own folder (only its own `.trash-<name>`: the rest of that folder is the user's).
 pub fn clear_trash(root: &Path, games: &[Game]) {
     let mut dirs = vec![root];
     for p in games.iter().filter_map(|g| g.dir.parent()) {
@@ -748,6 +812,14 @@ pub fn clear_trash(root: &Path, games: &[Game]) {
         for e in std::fs::read_dir(d).into_iter().flatten().flatten() {
             if e.file_name().to_string_lossy().starts_with(".trash-") {
                 let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    }
+    for d in games.iter().filter_map(|g| g.game_dir.as_ref().filter(|d| !d.starts_with(&g.dir))) {
+        if let (Some(p), Some(n)) = (d.parent(), d.file_name()) {
+            let t = p.join(format!(".trash-{}", n.to_string_lossy()));
+            if t.symlink_metadata().is_ok_and(|m| m.is_dir()) {
+                let _ = std::fs::remove_dir_all(t);
             }
         }
     }
@@ -1211,11 +1283,22 @@ pub fn game_pids(g: &Game) -> Vec<u32> {
     pids
 }
 
+/// Refuse while any process of the game runs (its prefix, or for a native emulator its game file).
+pub fn ensure_stopped(g: &Game) -> Result<()> {
+    if game_pids(g).is_empty() {
+        return Ok(());
+    }
+    bail!("{} is running (game, installer or tool). Close it, or press Stop game on its page.", g.name)
+}
+
+/// SIGKILL every process of the game, native emulators included; returns how many were signalled.
+pub fn kill_game(g: &Game) -> usize {
+    game_pids(g).into_iter().filter(|&pid| unsafe { libc::kill(pid as i32, libc::SIGKILL) } == 0).count()
+}
+
 /// Unpack a backup over the profile: files in it replace the current ones, others are left alone.
 pub fn restore_saves(g: &Game, archive: &Path) -> Result<()> {
-    if !prefix_pids(&g.prefix()).is_empty() {
-        bail!("{} is running: it would write its own saves over the restored ones when it exits. Close it, or press Stop game on its page.", g.name);
-    }
+    ensure_stopped(g).map_err(|e| anyhow!("{e} A running game would write its own saves over the restored ones when it exits."))?;
     let prof = profile(g);
     std::fs::create_dir_all(&prof)?;
     let o = Command::new("tar").arg("-xzf").arg(archive).arg("-C").arg(&prof).output().context("start tar")?;
@@ -1345,13 +1428,18 @@ fn size_from(h: &[u8]) -> Option<u64> {
     (hits.len() == 1).then(|| hits[0]) // two candidates: not sure which, so unknown
 }
 
-/// Free bytes on the filesystem holding `p` (or its nearest existing parent).
-pub fn free_space(p: &Path) -> Option<u64> {
+/// (free, total) bytes of the filesystem holding `p` (or its nearest existing parent).
+fn space(p: &Path) -> Option<(u64, u64)> {
     use std::os::unix::ffi::OsStrExt;
     let dir = p.ancestors().find(|a| a.exists())?;
     let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    (unsafe { libc::statvfs(c.as_ptr(), &mut st) } == 0).then(|| st.f_bavail as u64 * st.f_frsize as u64)
+    (unsafe { libc::statvfs(c.as_ptr(), &mut st) } == 0).then(|| (st.f_bavail as u64 * st.f_frsize as u64, st.f_blocks as u64 * st.f_frsize as u64))
+}
+
+/// Free bytes on the filesystem holding `p` (or its nearest existing parent).
+pub fn free_space(p: &Path) -> Option<u64> {
+    space(p).map(|s| s.0)
 }
 
 /// A disk the user can move a game to.
@@ -1361,36 +1449,46 @@ pub struct Drive {
     /// Where games go on it: the games root if that lives there, else `<mount>/Games/repackd`.
     pub target: PathBuf,
     pub free: u64,
+    pub total: u64,
+    /// "Home" for the disk holding $HOME, else the mount's folder name ("/" for the root).
+    pub label: String,
     pub writable: bool,
     /// The mountinfo major:minor, not `st_dev`: btrfs subvolumes (/ and /home) share the former only.
     pub dev: u64,
 }
 
-/// Disk mounts from mountinfo text as (dev, mountpoint), real disk filesystems only, user-visible places only.
-fn parse_mounts(text: &str) -> Vec<(u64, PathBuf)> {
-    const SKIP: [&str; 10] = ["/boot", "/efi", "/proc", "/sys", "/dev", "/run", "/var", "/snap", "/tmp", "/nix"];
+/// Places `parse_mounts` leaves out: a path under one is not on the disk of an enclosing mount like `/`.
+const SKIP: [&str; 11] = ["/boot", "/efi", "/proc", "/sys", "/dev", "/run", "/var", "/snap", "/tmp", "/nix", "/.snapshots"];
+
+/// One mountinfo line as (filesystem, dev, mountpoint).
+fn mount_entry(l: &str) -> Option<(String, u64, PathBuf)> {
+    let f: Vec<&str> = l.split_whitespace().collect();
+    let sep = f.iter().position(|&x| x == "-")?;
+    if f.len() < 5 {
+        return None;
+    }
+    let (maj, min) = f[2].split_once(':')?;
+    let dev = libc::makedev(maj.parse().ok()?, min.parse().ok()?);
+    // spaces, tabs, newlines and backslashes come as \040-style octal escapes
+    let (mut raw, mut i) = (Vec::new(), 0);
+    let b = f[4].as_bytes();
+    while i < b.len() {
+        match (b[i], b.get(i + 1..i + 4).and_then(|o| std::str::from_utf8(o).ok()).and_then(|o| u8::from_str_radix(o, 8).ok())) {
+            (b'\\', Some(c)) => (raw.push(c), i += 4),
+            (c, _) => (raw.push(c), i += 1),
+        };
+    }
+    use std::os::unix::ffi::OsStringExt;
+    Some((f.get(sep + 1)?.to_string(), dev, PathBuf::from(std::ffi::OsString::from_vec(raw))))
+}
+
+/// Disk mounts from mountinfo text as (dev, mountpoint), real disk filesystems only, user-visible places only
+/// (never the mount holding `home`, or one inside it: /var/home on Silverblue and Bazzite).
+fn parse_mounts(text: &str, home: &Path) -> Vec<(u64, PathBuf)> {
     const FS: [&str; 11] = ["ext4", "btrfs", "xfs", "f2fs", "bcachefs", "ntfs3", "ntfs", "ntfs-3g", "fuseblk", "exfat", "vfat"];
-    text.lines().filter_map(|l| {
-        let f: Vec<&str> = l.split_whitespace().collect();
-        let sep = f.iter().position(|&x| x == "-")?;
-        if f.len() < 5 || !FS.contains(f.get(sep + 1)?) {
-            return None;
-        }
-        let (maj, min) = f[2].split_once(':')?;
-        let dev = libc::makedev(maj.parse().ok()?, min.parse().ok()?);
-        // spaces, tabs, newlines and backslashes come as \040-style octal escapes
-        let (mut raw, mut i) = (Vec::new(), 0);
-        let b = f[4].as_bytes();
-        while i < b.len() {
-            match (b[i], b.get(i + 1..i + 4).and_then(|o| std::str::from_utf8(o).ok()).and_then(|o| u8::from_str_radix(o, 8).ok())) {
-                (b'\\', Some(c)) => (raw.push(c), i += 4),
-                (c, _) => (raw.push(c), i += 1),
-            };
-        }
-        use std::os::unix::ffi::OsStringExt;
-        let mount = PathBuf::from(std::ffi::OsString::from_vec(raw));
+    text.lines().filter_map(mount_entry).filter(|(fs, ..)| FS.contains(&fs.as_str())).filter_map(|(_, dev, mount)| {
         let removable = mount.starts_with("/run/media") && mount.components().count() >= 5; // /run/media/<user>/<label>
-        let hidden = SKIP.iter().any(|s| mount.starts_with(s)) || mount.starts_with("/.snapshots");
+        let hidden = SKIP.iter().any(|s| mount.starts_with(s)) && (home.as_os_str().is_empty() || !home.starts_with(&mount) && !mount.starts_with(home));
         (removable || !hidden).then_some((dev, mount))
     }).collect()
 }
@@ -1414,15 +1512,53 @@ fn pick_drives(mounts: &[(u64, PathBuf)], home: &Path, root: &Path) -> Vec<(u64,
     out
 }
 
-/// The disks a game can move to, the one holding $HOME first. `root` is the configured games root.
-pub fn drives(root: &Path) -> Vec<Drive> {
+/// The disks repackd knows, as (dev, mountpoint).
+pub fn mounts() -> Vec<(u64, PathBuf)> {
+    parse_mounts(&std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default(), &home())
+}
+
+/// The dev of the longest mountpoint holding `path`. None when unsure: a path under a place `parse_mounts`
+/// skips (/tmp, /run...) that no listed mount covers more closely is not on the disk of `/`.
+pub fn drive_of(path: &Path, mounts: &[(u64, PathBuf)]) -> Option<u64> {
+    drive_of_in(path, mounts, &home())
+}
+
+/// `drive_of` with $HOME given; a path under it is never "unsure" (/var/home on Silverblue).
+fn drive_of_in(path: &Path, mounts: &[(u64, PathBuf)], home: &Path) -> Option<u64> {
+    let (dev, m) = mounts.iter().filter(|(_, m)| path.starts_with(m)).max_by_key(|(_, m)| m.as_os_str().len())?;
+    ((!home.as_os_str().is_empty() && path.starts_with(home)) || !SKIP.iter().any(|s| path.starts_with(s) && !m.starts_with(s))).then_some(*dev)
+}
+
+/// The disks a game can move to, the one holding $HOME first, and the mounts they came from (read once).
+/// `root` is the configured games root.
+pub fn drives(root: &Path) -> (Vec<Drive>, Vec<(u64, PathBuf)>) {
     use std::os::unix::ffi::OsStrExt;
-    let text = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
-    pick_drives(&parse_mounts(&text), &home(), root).into_iter().map(|(dev, mount, target)| {
+    let mounts = mounts();
+    let home = home();
+    let home_dev = drive_of(&home, &mounts);
+    let drives = pick_drives(&mounts, &home, root).into_iter().map(|(dev, mount, target)| {
         let writable = target.ancestors().find(|a| a.exists()).and_then(|a| std::ffi::CString::new(a.as_os_str().as_bytes()).ok())
             .is_some_and(|c| unsafe { libc::access(c.as_ptr(), libc::W_OK) } == 0);
-        Drive { free: free_space(&mount).unwrap_or(0), mount, target, writable, dev }
-    }).collect()
+        let (free, total) = space(&mount).unwrap_or((0, 0));
+        let label = if Some(dev) == home_dev { "Home".into() } else { mount.file_name().map_or("/".into(), |n| n.to_string_lossy().into_owned()) };
+        Drive { free, total, label, mount, target, writable, dev }
+    }).collect();
+    (drives, mounts)
+}
+
+/// Where an imported game's own folder goes when moved to this drive: `<mount>/Games`, `$HOME/Games` for Home.
+pub fn files_target(d: &Drive) -> PathBuf {
+    if d.label == "Home" { home().join("Games") } else { d.mount.join("Games") }
+}
+
+/// Fail unless `at` has `bytes` plus `spare` free (unknown free space passes).
+fn need_space(at: &Path, bytes: u64, spare: u64) -> Result<()> {
+    if let Some(free) = free_space(at)
+        && free < bytes + spare
+    {
+        bail!("not enough space at {}: needs {} plus {} spare, {} free", at.display(), gb(bytes), gb(spare), gb(free));
+    }
+    Ok(())
 }
 
 pub fn gb(b: u64) -> String {
@@ -1621,7 +1757,7 @@ pub fn run_inno(g: &Game, setup: &Path, unattended: bool, log: &impl Report) -> 
     let st = std::thread::scope(|s| {
         s.spawn(|| stall_watch(&g.install_dir(), g.size, &done, every, Duration::from_secs(300), step, log));
         s.spawn(|| closed_watch(&logf, &g.prefix(), &done, &killed, Duration::from_secs(3), Duration::from_secs(30), log));
-        let r = run(c, log);
+        let r = run(c, None, log);
         done.store(true, Ordering::Relaxed);
         r
     })?;
@@ -1656,15 +1792,15 @@ pub fn dir_size(d: &Path) -> u64 {
 }
 
 /// Why `g` can't be moved into `to_parent` right now (checked again when the job runs).
-pub fn move_refusal(g: &Game, to_parent: &Path) -> Result<()> {
+pub fn move_refusal(g: &Game, to_parent: &Path, files_to: Option<&Path>, others: &[PathBuf]) -> Result<()> {
     let new = to_parent.join(g.dir.file_name().context("the game folder has no name")?);
-    if !game_pids(g).is_empty() {
-        bail!("{} is running (game, installer or tool). Close it, or press Stop game on its page.", g.name);
-    }
+    ensure_stopped(g)?;
     if g.steam.is_some() && steam::running() {
         bail!("close Steam first: this game has a Steam shortcut that must be updated");
     }
-    if new.symlink_metadata().is_ok() {
+    // repackd's folder already there (a split game whose files live elsewhere): only the files move
+    let stay = new == g.dir;
+    if !stay && new.symlink_metadata().is_ok() {
         bail!("{} already exists: pick another folder", new.display());
     }
     // canonical on both sides: a symlinked parent can lead back into the game folder
@@ -1673,7 +1809,32 @@ pub fn move_refusal(g: &Game, to_parent: &Path) -> Result<()> {
     if inside.starts_with(g.dir.canonicalize().unwrap_or(g.dir.clone())) {
         bail!("the destination is inside the game's own folder");
     }
+    if files_plan(g, files_to, others)?.is_none() && stay {
+        bail!("{} is already there", g.name);
+    }
     Ok(())
+}
+
+/// Where an imported game's own folder goes: `files_to` (the drive's `Games` folder, see `files_target`) plus its
+/// name. None when there is nothing to move: not imported, already there, or no `files_to` ("Other folder…"),
+/// where only repackd's folder moves.
+pub fn files_dest(g: &Game, files_to: Option<&Path>) -> Option<PathBuf> {
+    let d = g.game_dir.as_ref().filter(|d| !d.starts_with(&g.dir))?;
+    let dest = files_to?.join(d.file_name()?);
+    (dest != *d).then_some(dest)
+}
+
+/// (guarded source, destination) of an imported game's folder move; refuses an existing destination or one inside the source.
+fn files_plan(g: &Game, files_to: Option<&Path>, others: &[PathBuf]) -> Result<Option<(PathBuf, PathBuf)>> {
+    let Some(dest) = files_dest(g, files_to) else { return Ok(None) };
+    let Some(src) = files_guard(g.dir.parent().unwrap_or(&g.dir), g, &home(), &all_mountpoints(), others)? else { return Ok(None) };
+    if dest.symlink_metadata().is_ok() {
+        bail!("{} already exists: the game's folder can't move there", dest.display());
+    }
+    if dest.ancestors().find(|a| a.exists()).and_then(|a| a.canonicalize().ok()).is_none_or(|c| c.starts_with(&src)) {
+        bail!("the destination is inside the game's own folder");
+    }
+    Ok(Some((src, dest)))
 }
 
 /// Files, symlinks and file bytes under `d`, links not followed (what `copy_move` must reproduce).
@@ -1743,13 +1904,7 @@ fn relocate(old: &Path, new: &Path, log: &impl Report) -> Result<()> {
         return Ok(());
     }
     // any rename failure (normally EXDEV, another disk) falls back to copying, which fails by itself if it must
-    // space is checked only here: a same-disk rename needs none
-    let size = dir_size(old);
-    if let Some(free) = new.parent().and_then(free_space)
-        && free < size + (1 << 30)
-    {
-        bail!("not enough space at {}: needs {} plus 1 GB spare, {} free", new.parent().unwrap_or(new).display(), gb(size), gb(free));
-    }
+    // no space check: move_game checked both folders up front
     log.step("Copying to the new folder");
     copy_move(old, new, log)?;
     log.step("Removing the old folder");
@@ -1759,13 +1914,36 @@ fn relocate(old: &Path, new: &Path, log: &impl Report) -> Result<()> {
     Ok(())
 }
 
-/// Move the game's own folder (and its save backups) into `to_parent`; returns the new folder. The library
-/// entry is the caller's to update.
-pub fn move_game(g: &Game, to_parent: &Path, log: &impl Report) -> Result<PathBuf> {
-    move_refusal(g, to_parent)?;
+/// Move the game's own folder (and its save backups) into `to_parent`, an imported game's own folder first
+/// (to `files_to`, see `files_dest`); returns (new folder, new game folder). The library entry is the caller's to update.
+/// If the files moved but the folder could not, that is (old folder, Some(new game folder)): what really moved.
+pub fn move_game(g: &Game, to_parent: &Path, files_to: Option<&Path>, others: &[PathBuf], log: &impl Report) -> Result<(PathBuf, Option<PathBuf>)> {
+    move_refusal(g, to_parent, files_to, others)?;
     let new = to_parent.join(g.dir.file_name().context("the game folder has no name")?);
+    let files = files_plan(g, files_to, others)?;
     std::fs::create_dir_all(to_parent).with_context(|| format!("create {}", to_parent.display()))?;
-    relocate(&g.dir, &new, log)?;
+    // space for both up front: the second copy must not fail after the first has moved
+    use std::os::unix::fs::MetadataExt;
+    let dev = |p: &Path| p.ancestors().find_map(|a| a.metadata().ok()).map(|m| m.dev());
+    let stay = new == g.dir;
+    let need: u64 = [(!stay).then_some(&g.dir), files.as_ref().map(|f| &f.0)].into_iter().flatten().filter(|p| dev(p) != dev(to_parent)).map(|p| dir_size(p)).sum();
+    if need > 0 {
+        need_space(to_parent, need, 1 << 30)?;
+    }
+    let mut moved_files = None;
+    if let Some((src, dest)) = files {
+        std::fs::create_dir_all(dest.parent().unwrap_or(&dest)).with_context(|| format!("create {}", dest.display()))?;
+        relocate(&src, &dest, log)?;
+        moved_files = Some(dest);
+    }
+    if stay {
+        return Ok((new, moved_files));
+    }
+    if let Err(e) = relocate(&g.dir, &new, log) {
+        let Some(f) = moved_files else { return Err(e) };
+        log.log(format!("warning: the game files moved to {}, but repackd's folder stays in {}: {e:#}", f.display(), g.dir.display()));
+        return Ok((g.dir.clone(), Some(f)));
+    }
     if let Err(e) = std::fs::write(new.join(MOVED_MARK), b"") {
         log.log(format!("could not mark the game as moved ({e}): Delete will refuse it until the folder is back in the games root"));
     }
@@ -1777,7 +1955,7 @@ pub fn move_game(g: &Game, to_parent: &Path, log: &impl Report) -> Result<PathBu
             log.log(format!("warning: save backups stay in {}: {e:#}", from.display()));
         }
     }
-    Ok(new)
+    Ok((new, moved_files))
 }
 
 /// FitGirl's unpacker shows its own error dialog even in silent mode and then waits forever, so a setup
@@ -1873,6 +2051,13 @@ pub fn kill_prefix(pfx: &Path) -> usize {
     prefix_pids(pfx).into_iter().filter(|&pid| unsafe { libc::kill(pid as i32, libc::SIGKILL) } == 0).count()
 }
 
+/// Whether a process has `file` as a command-line argument.
+fn exe_running(file: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let want = file.as_os_str().as_bytes();
+    std::fs::read_dir("/proc").into_iter().flatten().flatten().any(|e| std::fs::read(e.path().join("cmdline")).is_ok_and(|c| c.split(|&b| b == 0).any(|a| a == want)))
+}
+
 /// PIDs of this user's processes running in the prefix.
 pub fn prefix_pids(pfx: &Path) -> Vec<u32> {
     let mut out = vec![];
@@ -1896,7 +2081,9 @@ pub fn prefix_pids(pfx: &Path) -> Vec<u32> {
 /// Run with stdout and stderr streamed to `log` line by line. When the command ends, what it left running in
 /// its prefix (`WINEPREFIX`) is killed, because that holds the pipes open forever; a reader still stuck 5 s
 /// after that is given up on.
-pub fn run(mut c: Command, log: &impl Report) -> Result<ExitStatus> {
+/// `keep`: the game's exe; when a process runs it after the child exits (a game started meanwhile), the prefix is
+/// left alone. shortcut: matches the exe path in command lines only, so a game started through another launcher path is still killed.
+pub fn run(mut c: Command, keep: Option<&Path>, log: &impl Report) -> Result<ExitStatus> {
     // a prefix with processes already (a game) is not ours to clean
     let pfx = c.get_envs().find_map(|(k, v)| v.filter(|_| k == "WINEPREFIX")).map(PathBuf::from).filter(|p| prefix_pids(p).is_empty());
     let mut child = c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().with_context(|| format!("start {:?}", c.get_program()))?;
@@ -1923,7 +2110,7 @@ pub fn run(mut c: Command, log: &impl Report) -> Result<ExitStatus> {
             }
         });
         let st = child.wait();
-        if let Some(p) = &pfx {
+        if let Some(p) = pfx.as_ref().filter(|_| !keep.is_some_and(exe_running)) {
             kill_prefix(p); // the child is reaped: only its orphans (and the tagged 7z, long done) are left
         }
         exited.store(true, Ordering::Relaxed);
@@ -1934,9 +2121,7 @@ pub fn run(mut c: Command, log: &impl Report) -> Result<ExitStatus> {
 /// Everything an install checks before it changes anything: the repack's files, its setup.exe, disk space.
 /// A failure here leaves an installed game as it was (still playable). Returns setup.exe.
 pub fn install_checks(g: &Game, verify_first: bool, log: &impl Report) -> Result<PathBuf> {
-    if !game_pids(g).is_empty() {
-        bail!("{} is running: installing over a running game breaks both. Close it, or press Stop game on its page.", g.name);
-    }
+    ensure_stopped(g).map_err(|e| anyhow!("{e} Installing over a running game breaks both."))?;
     if g.proton_path() == "GE-Proton" && !protons().iter().any(|(l, v)| v.contains('/') && l.starts_with("GE-Proton")) {
         log.log("The first start downloads Proton (about 500 MB).".into());
     }
@@ -1952,11 +2137,8 @@ pub fn install_checks(g: &Game, verify_first: bool, log: &impl Report) -> Result
         }
     }
     let setup = find_setup(&g.repack_dir)?;
-    if let (Some(need), Some(free)) = (g.size, free_space(&g.dir)) {
-        let need = need.saturating_sub(dir_size(&g.install_dir())) + (512 << 20); // a reinstall overwrites what is there; margin for redists and logs
-        if free < need {
-            bail!("not enough disk space: the game needs {} more, {} free at {}", gb(need), gb(free), g.dir.display());
-        }
+    if let Some(need) = g.size {
+        need_space(&g.dir, need.saturating_sub(dir_size(&g.install_dir())), 512 << 20)?; // a reinstall overwrites what is there; margin for redists and logs
     }
     cancel_point(log)?;
     Ok(setup)
@@ -1996,7 +2178,7 @@ fn create_prefix(g: &Game, log: &impl Report) -> Result<()> {
     log.step(STEP_FIRST_START);
     let mut c = g.umu();
     c.args(["wineboot", "-u"]);
-    let st = run(c, log)?;
+    let st = run(c, None, log)?;
     if !g.prefix().join("drive_c").is_dir() {
         bail!("could not create the Wine prefix ({st})");
     }
@@ -2031,7 +2213,7 @@ pub(crate) fn install_redists(g: &Game, log: &impl Report) -> Result<()> {
         log.log(format!("installing {name}"));
         let mut c = g.umu();
         c.arg(&p).args(args);
-        match run(c, log)?.code() {
+        match run(c, None, log)?.code() {
             Some(0 | 1638 | 3010) => {} // ok, newer one already there, reboot wanted
             code => log.log(format!("warning: {name} exited with {code:?}; the game may still run on Wine's built-in runtime")),
         }
@@ -2039,7 +2221,7 @@ pub(crate) fn install_redists(g: &Game, log: &impl Report) -> Result<()> {
     Ok(())
 }
 
-/// A folder `scan_folder` found: a repack to install, or a game that is already unpacked.
+/// A folder `scan_known` found: a repack to install, or a game that is already unpacked.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Found {
     pub dir: PathBuf,
@@ -2051,12 +2233,8 @@ pub fn known_dirs(lib: &Library) -> Vec<PathBuf> {
     lib.games.iter().flat_map(|g| [g.repack_dir.clone(), g.install_dir()]).filter(|p| !p.as_os_str().is_empty()).map(|p| std::fs::canonicalize(&p).unwrap_or(p)).collect()
 }
 
-/// The repacks and unpacked games among the direct subfolders of `dir` that the library does not have yet.
-pub fn scan_folder(dir: &Path, lib: &Library) -> Vec<Found> {
-    scan_known(dir, &known_dirs(lib))
-}
-
-/// `scan_folder` against an already collected `known_dirs` (the watch thread has no library). Listings only.
+/// The repacks and unpacked games among the direct subfolders of `dir` that the library does not have yet
+/// (`known_dirs`, collected by the caller: the watch thread has no library). Listings only.
 pub fn scan_known(dir: &Path, known: &[PathBuf]) -> Vec<Found> {
     // (name, is a folder) of everything directly in `d`
     let list = |d: &Path| -> Vec<(String, bool)> { std::fs::read_dir(d).into_iter().flatten().flatten().map(|e| (e.file_name().to_string_lossy().into_owned(), e.file_type().is_ok_and(|t| t.is_dir()))).collect() };
@@ -2448,7 +2626,7 @@ mod tests {
 
     #[test]
     fn drives_from_mountinfo() {
-        let m = parse_mounts(MOUNTS);
+        let m = parse_mounts(MOUNTS, Path::new("/home/u"));
         let names: Vec<_> = m.iter().map(|(_, p)| p.to_str().unwrap()).collect();
         assert_eq!(names, ["/", "/home", "/mnt/data", "/mnt/my disk", "/run/media/u/WIN"]);
         let d = pick_drives(&m, Path::new("/home/u"), Path::new("/mnt/data/Games/repackd"));
@@ -2467,7 +2645,7 @@ mod tests {
     #[test]
     #[ignore]
     fn show_drives() {
-        for d in drives(&games_root()) {
+        for d in drives(&games_root()).0 {
             println!("{d:?}");
         }
     }
@@ -2564,7 +2742,7 @@ mod tests {
         std::fs::create_dir_all(old.join(".trash-left")).unwrap();
         clear_trash(&lib.root, &lib.games);
         assert!(!old.join(".trash-left").exists());
-        lib.delete(i).unwrap();
+        del(&mut lib, i).unwrap();
         assert!(!first.exists() && !old.join(".trash-rp-a").exists());
         // a refused root: inside a game, or under a trash folder
         assert!(root_refusal(&lib.games[0].dir.join("sub"), &lib.games).is_err());
@@ -2573,7 +2751,7 @@ mod tests {
         // an unmarked folder outside the root is still refused
         let out = d.join("elsewhere/g");
         std::fs::create_dir_all(&out).unwrap();
-        assert!(delete_files(&new, &Game { name: "g".into(), dir: out.clone(), ..Default::default() }).is_err() && out.is_dir());
+        assert!(delete_files(&new, &Game { name: "g".into(), dir: out.clone(), ..Default::default() }, false, &[], &|_: String| {}).is_err() && out.is_dir());
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -2584,10 +2762,220 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         let g = Game { name: "g".into(), dir: dir.clone(), ..Default::default() };
-        assert!(delete_files(&root, &g).is_err() && dir.is_dir()); // unmarked: refused
+        assert!(delete_files(&root, &g, false, &[], &|_: String| {}).is_err() && dir.is_dir()); // unmarked: refused
         std::fs::write(dir.join(MOVED_MARK), b"").unwrap();
-        delete_files(&root, &g).unwrap();
+        delete_files(&root, &g, false, &[], &|_: String| {}).unwrap();
         assert!(!dir.exists() && !d.join("elsewhere/.trash-g").exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn drive_of_nested_mounts() {
+        let m = parse_mounts(&format!("{MOUNTS}80 41 8:33 / /mnt/data/sub rw - ext4 /dev/sdd1 rw\n"), Path::new("/home/u"));
+        let dev = |p: &str| drive_of(Path::new(p), &m).map(|d| (libc::major(d), libc::minor(d)));
+        assert_eq!(dev("/home/u/Games"), dev("/")); // btrfs: / and /home are one dev
+        assert_eq!(dev("/home/u/Games"), Some((0, 35)));
+        assert_eq!(dev("/mnt/data/g"), Some((8, 17)));
+        assert_eq!(dev("/mnt/data/sub/g"), Some((8, 33))); // longest mountpoint wins
+        assert_eq!(dev("/mnt/database"), dev("/")); // component-wise, not a string prefix
+        assert_eq!(dev("/tmp/x"), None); // skipped mount: not "/"
+        assert_eq!(dev("/run/user/1000/x"), None);
+        assert_eq!(dev("/run/media/u/WIN/g"), Some((0, 60))); // listed removable disk beats the /run skip
+    }
+
+    #[test]
+    fn var_home_is_a_drive() {
+        let text = format!("{MOUNTS}90 41 0:40 /home /var/home rw - btrfs /dev/nvme0n1p2 rw\n");
+        let home = Path::new("/var/home/u");
+        let m = parse_mounts(&text, home);
+        assert!(m.iter().any(|(_, p)| p == Path::new("/var/home")));
+        assert!(!parse_mounts(&text, Path::new("/home/u")).iter().any(|(_, p)| p == Path::new("/var/home"))); // other mounts under /var stay hidden
+        let dev = |p: &str| drive_of_in(Path::new(p), &m, home).map(|d| (libc::major(d), libc::minor(d)));
+        assert_eq!(dev("/var/home/u/Games"), Some((0, 40)));
+        // home on "/" itself, no mount of its own: still the disk of "/"
+        assert_eq!(drive_of_in(Path::new("/var/home/u/g"), &[(7, "/".into())], home), Some(7));
+        assert_eq!(drive_of_in(Path::new("/var/lib/x"), &[(7, "/".into())], home), None);
+    }
+
+    #[test]
+    fn guard_sees_every_mountpoint() {
+        let text = "70 41 0:61 / /srv/game/nfs rw - nfs4 host:/x rw\n71 41 0:62 / /srv/game/t rw - tmpfs tmpfs rw\n";
+        assert!(parse_mounts(text, Path::new("/home/u")).is_empty()); // the disk list filters them out
+        let all: Vec<_> = text.lines().filter_map(|l| mount_entry(l).map(|(_, d, m)| (d, m))).collect();
+        assert_eq!(all.len(), 2);
+        let d = tmp("guardmnt");
+        let root = d.join("A/repackd");
+        let g = imported(&d.join("A"));
+        mark_game(&g.dir);
+        let gd = g.game_dir.clone().unwrap();
+        let inner = [(1, gd.join("bin/sub"))]; // what all_mountpoints returns for a fuse/nfs mount inside the game folder
+        let home = d.join("home");
+        assert!(delete_files_in(&root, &g, true, &home, &inner, &[], &|_: String| {}).is_err() && gd.join("bin/sub/data.pak").is_file());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn failed_trash_removal_still_removes_the_game() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmp("trashfail");
+        let root = d.join("A/repackd");
+        let g = imported(&d.join("A"));
+        mark_game(&g.dir);
+        let gd = g.game_dir.clone().unwrap();
+        let home = d.join("home");
+        std::fs::set_permissions(gd.join("bin"), std::fs::Permissions::from_mode(0o555)).unwrap(); // its file cannot be unlinked
+        let lines = std::sync::Mutex::new(vec![]);
+        let r = delete_files_in(&root, &g, true, &home, &[], &[], &|l: String| lines.lock().unwrap().push(l));
+        std::fs::set_permissions(d.join("A/.trash-MyGame/bin"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        r.unwrap();
+        assert!(!g.dir.exists() && !gd.exists() && d.join("A/.trash-MyGame").is_dir());
+        assert!(lines.lock().unwrap().iter().any(|l| l.contains("could not be fully deleted")));
+        // the leftover sits beside the game's own folder, not in the games root: clear_trash looks there
+        clear_trash(&root, &[g]);
+        assert!(!d.join("A/.trash-MyGame").exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `delete_files` for library entry `i`, then drop it (what the app does on `Ev::Removed`).
+    fn del(lib: &mut Library, i: usize) -> Result<()> {
+        delete_files(&lib.root, &lib.games[i], false, &others_of(&lib.games, &lib.games[i]), &|_: String| {})?;
+        lib.games.remove(i);
+        Ok(())
+    }
+
+    /// An imported game: files in `a/MyGame`, repackd's folder in `a/repackd/mygame`.
+    fn imported(a: &Path) -> Game {
+        use std::os::unix::fs::symlink;
+        let (gd, dir) = (a.join("MyGame"), a.join("repackd/mygame"));
+        std::fs::create_dir_all(gd.join("bin/sub")).unwrap();
+        std::fs::write(gd.join("bin/game.exe"), b"MZ").unwrap();
+        std::fs::write(gd.join("bin/sub/data.pak"), b"12345").unwrap();
+        std::fs::create_dir_all(dir.join("pfx/dosdevices")).unwrap();
+        symlink(gd.parent().unwrap(), dir.join("pfx/dosdevices/r:")).unwrap();
+        Game { name: "My Game".into(), dir, game_dir: Some(gd.clone()), exe: Some(gd.join("bin/game.exe")), ..Default::default() }
+    }
+
+    #[test]
+    fn move_imported_game() {
+        let d = tmp("moveimp");
+        let (a, b) = (d.join("A"), d.join("B"));
+        let g = imported(&a);
+        let to = b.join("Games/repackd");
+        let ft = b.join("Games");
+        assert_eq!(files_dest(&g, Some(&ft)), Some(b.join("Games/MyGame")));
+        assert_eq!(files_dest(&g, None), None);
+        // refused up front when the game folder's destination exists
+        std::fs::create_dir_all(b.join("Games/MyGame")).unwrap();
+        assert!(move_game(&g, &to, Some(&ft), &[], &|_: String| {}).is_err() && g.dir.is_dir() && g.game_dir.as_ref().unwrap().is_dir());
+        std::fs::remove_dir(b.join("Games/MyGame")).unwrap();
+        let (new, files) = move_game(&g, &to, Some(&ft), &[], &|_: String| {}).unwrap();
+        let files = files.unwrap();
+        assert_eq!((new.clone(), files.clone()), (b.join("Games/repackd/mygame"), b.join("Games/MyGame")));
+        assert!(!g.dir.exists() && !g.game_dir.as_ref().unwrap().exists());
+        assert!(files.join("bin/sub/data.pak").is_file() && new.join("pfx/dosdevices/r:").symlink_metadata().is_ok());
+        let mut g2 = g.clone();
+        g2.moved_to(&new);
+        g2.files_moved_to(&files);
+        assert_eq!((g2.game_dir.clone(), g2.exe.clone(), g2.dir.clone()), (Some(files.clone()), Some(files.join("bin/game.exe")), new));
+        // the copy path (another filesystem) for the game files
+        let g3 = imported(&d.join("C"));
+        let dest = d.join("D/MyGame");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        let src = g3.game_dir.clone().unwrap();
+        copy_move(&src, &dest, &|_: String| {}).unwrap();
+        assert_eq!(tree_count(&dest).unwrap(), tree_count(&src).unwrap());
+        assert_eq!(std::fs::read(dest.join("bin/sub/data.pak")).unwrap(), b"12345");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn move_split_game_brings_only_its_files() {
+        let d = tmp("movesplit");
+        let g = imported(&d.join("A"));
+        let to = g.dir.parent().unwrap().to_path_buf(); // repackd's folder is already on the target drive
+        let ft = d.join("E/Games");
+        let (new, files) = move_game(&g, &to, Some(&ft), &[], &|_: String| {}).unwrap();
+        assert_eq!((new, files), (g.dir.clone(), Some(ft.join("MyGame"))));
+        assert!(g.dir.join("pfx").is_dir() && ft.join("MyGame/bin/game.exe").is_file() && !g.game_dir.as_ref().unwrap().exists());
+        // nothing left to move: refused, not a silent no-op
+        let mut g2 = g.clone();
+        g2.files_moved_to(&ft.join("MyGame"));
+        assert!(move_refusal(&g2, &to, Some(&ft), &[]).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn move_with_custom_root_honours_files_to() {
+        let d = tmp("movecustom");
+        let g = imported(&d.join("A"));
+        // a custom root: nothing says "Games/repackd", the files still go to files_to
+        let to = d.join("B/my/root");
+        let ft = d.join("B/Games");
+        let (new, files) = move_game(&g, &to, Some(&ft), &[], &|_: String| {}).unwrap();
+        assert_eq!((new, files), (to.join("mygame"), Some(ft.join("MyGame"))));
+        assert!(!d.join("B/my/MyGame").exists() && ft.join("MyGame/bin/game.exe").is_file());
+        // "Other folder…": only repackd's folder moves
+        let g = imported(&d.join("C"));
+        let (_, files) = move_game(&g, &d.join("E/x"), None, &[], &|_: String| {}).unwrap();
+        assert!(files.is_none() && g.game_dir.unwrap().join("bin/game.exe").is_file());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn move_imported_prefix_failure_reports_files() {
+        let d = tmp("movepart");
+        let g = imported(&d.join("A"));
+        // a read-only target: the game files move into the writable Games folder, the prefix cannot follow
+        use std::os::unix::fs::PermissionsExt;
+        let to = d.join("B/Games/repackd");
+        std::fs::create_dir_all(&to).unwrap();
+        std::fs::set_permissions(&to, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let r = move_game(&g, &to, Some(&d.join("B/Games")), &[], &|_: String| {});
+        std::fs::set_permissions(&to, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (dir, files) = r.unwrap();
+        assert_eq!((dir, files.clone()), (g.dir.clone(), Some(d.join("B/Games/MyGame"))));
+        assert!(g.dir.is_dir() && files.unwrap().join("bin/game.exe").is_file() && !g.game_dir.as_ref().unwrap().exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn delete_imported_files() {
+        let d = tmp("delimp");
+        let root = d.join("A/repackd");
+        let mut g = imported(&d.join("A"));
+        g.status = Status::Installed;
+        let gd = g.game_dir.clone().unwrap();
+        let (home, none) = (d.join("home"), Vec::new());
+        std::fs::create_dir_all(&home).unwrap();
+        mark_game(&g.dir);
+        let g0 = g.clone();
+        // without the flag the user's folder stays
+        delete_files_in(&root, &g0, false, &home, &none, &[], &|_: String| {}).unwrap();
+        assert!(gd.join("bin/game.exe").is_file() && !g.dir.exists());
+        // guards, each checked before anything is deleted
+        let g = imported(&d.join("A"));
+        mark_game(&g.dir);
+        let bad = |x: Game, m: &[(u64, PathBuf)], h: &Path| delete_files_in(&root, &x, true, h, m, &[], &|_: String| {}).is_err() && g.dir.is_dir() && gd.join("bin/game.exe").is_file();
+        let mp = vec![(1, gd.clone())];
+        assert!(bad(g.clone(), &mp, &home), "mountpoint");
+        assert!(bad(g.clone(), &[(1, gd.join("bin"))], &home), "mount inside");
+        assert!(bad(g.clone(), &none, &gd.join("bin")), "holds home");
+        assert!(bad(Game { game_dir: Some("/".into()), ..g.clone() }, &none, &home), "root");
+        assert!(bad(Game { game_dir: Some(d.join("A")), ..g.clone() }, &none, &home), "holds the games root");
+        assert!(bad(Game { game_dir: Some(root.clone()), ..g.clone() }, &none, &home), "is the games root");
+        assert!(bad(Game { exe: Some(d.join("elsewhere.exe")), ..g.clone() }, &none, &home), "exe outside");
+        assert!(bad(Game { exe: None, ..g.clone() }, &none, &home), "no exe");
+        let o = Game { repack_dir: gd.join("bin"), ..Default::default() };
+        let others = others_of(&[g.clone(), o], &g);
+        assert_eq!(others, vec![gd.join("bin")]);
+        assert!(delete_files_in(&root, &g, true, &home, &none, &others, &|_: String| {}).is_err() && gd.join("bin/game.exe").is_file(), "holds another game");
+        let link = d.join("A/link");
+        std::os::unix::fs::symlink(&gd, &link).unwrap();
+        assert!(bad(Game { game_dir: Some(link), ..g.clone() }, &none, &home), "symlink");
+        // allowed: the folder goes, repackd's folder goes, nothing else
+        std::fs::write(d.join("A/other.txt"), b"keep").unwrap();
+        delete_files_in(&root, &g, true, &home, &none, &[], &|_: String| {}).unwrap();
+        assert!(!gd.exists() && !g.dir.exists() && d.join("A/other.txt").is_file() && !d.join("A/.trash-MyGame").exists());
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -2883,11 +3271,11 @@ mod tests {
         // stands in for a Wine process: Proton runs them with WINEPREFIX=<pfx>/pfx/
         let mut child = Command::new("sleep").arg("30").env("WINEPREFIX", pfx.join("pfx/")).spawn().unwrap();
         assert_eq!(prefix_pids(&pfx), [child.id()]);
-        assert!(lib.delete(0).unwrap_err().to_string().contains("is running"));
+        assert!(del(&mut lib, 0).unwrap_err().to_string().contains("is running"));
         assert_eq!(kill_prefix(&pfx), 1);
         child.wait().unwrap();
         assert!(prefix_pids(&pfx).is_empty());
-        lib.delete(0).unwrap();
+        del(&mut lib, 0).unwrap();
         std::fs::remove_dir_all(&d).unwrap();
     }
 
@@ -2970,7 +3358,7 @@ mod tests {
         std::fs::write(d.join("setup.exe"), b"").unwrap();
         let g = Game { name: "g".into(), repack_dir: d.clone(), dir: d.join("games/g"), size: Some(1 << 60), ..Default::default() };
         let e = install_checks(&g, false, &|_| {}).unwrap_err().to_string();
-        assert!(e.contains("not enough disk space"), "{e}");
+        assert!(e.contains("not enough space"), "{e}");
         assert!(!g.dir.exists(), "nothing created before the check");
         assert!(free_space(&d.join("not/yet/there")).is_some_and(|f| f > 0));
         assert_eq!(setup_size(b"not an installer"), None);
@@ -2989,7 +3377,7 @@ mod tests {
         }
         let mut lib = Library::load(d.join("lib.json"), d.join("games")).unwrap();
         lib.games.push(Game { name: "c".into(), repack_dir: d.join("dl/Known C"), dir: d.join("games/c"), ..Default::default() });
-        let got = scan_folder(&d.join("dl"), &lib);
+        let got = scan_known(&d.join("dl"), &known_dirs(&lib));
         assert_eq!(got, [Found { dir: d.join("dl/Game B"), repack: false }, Found { dir: d.join("dl/Repack A"), repack: true }]);
         std::fs::remove_dir_all(&d).unwrap();
     }
@@ -3011,7 +3399,7 @@ mod tests {
         assert!(!g.has_repack());
         assert!(lib.import(gd.clone()).unwrap_err().to_string().contains("already"));
         std::fs::create_dir_all(lib.games[i].prefix()).unwrap();
-        lib.delete(i).unwrap();
+        del(&mut lib, i).unwrap();
         assert!(gd.join("Bin/Win64/KingdomCome.exe").exists(), "the game's own folder is never deleted");
         // a Switch dump is recognised by its .nsp
         let sw = d.join("Zelda");
@@ -3038,7 +3426,7 @@ mod tests {
             std::fs::create_dir_all(f.parent().unwrap()).unwrap();
             std::fs::write(f, body).unwrap();
         }
-        lib.delete(0).unwrap();
+        del(&mut lib, 0).unwrap();
         assert!(!g.dir.exists());
         let b = backups(&g);
         assert_eq!(b.len(), 1, "delete kept a backup outside the game dir: {b:?}");
@@ -3152,7 +3540,7 @@ mod tests {
         let back = Library::load(d.join("lib.json"), d.join("games")).unwrap();
         assert_eq!(back.games, lib.games);
         std::fs::create_dir_all(lib.games[0].prefix()).unwrap();
-        lib.delete(0).unwrap();
+        del(&mut lib, 0).unwrap();
         assert!(!d.join("games/some-game-fitgirl-repack").exists() && repack.join("Setup.exe").exists());
         // a Steam shortcut is removed even when the game file was cleared (type change)
         let vdf = d.join("shortcuts.vdf");
@@ -3161,14 +3549,14 @@ mod tests {
         steam::add(&vdf, "g", &g.launch_script(), &g.dir).unwrap();
         g.steam = Some(vdf.clone());
         if !steam::running() {
-            lib.delete(0).unwrap();
+            del(&mut lib, 0).unwrap();
             assert!(!steam::remove(&vdf, &d.join("games/some-game-fitgirl-repack-2/launch.sh")).unwrap(), "shortcut left behind");
             lib.add(repack.clone()).unwrap();
         }
         // a bad dir is refused before the Steam entry is touched
         lib.games[0].dir = d.join("games/../elsewhere");
         lib.games[0].steam = Some(d.join("no-such-dir/shortcuts.vdf"));
-        assert!(lib.delete(0).unwrap_err().to_string().contains("refusing"));
+        assert!(del(&mut lib, 0).unwrap_err().to_string().contains("refusing"));
         std::fs::remove_dir_all(&d).unwrap();
     }
 }

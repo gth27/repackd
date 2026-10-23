@@ -1,6 +1,6 @@
 //! Update ladder: FitGirl update folders ("Update v1.2 to v1.3", "... Build 123") and scene update archives
 //! ("Game.Update.v1.5.2-RUNE.part1.rar": a patcher in `Update/`, a crack beside it) applied in version order.
-use crate::{check, find_md5, find_setup, free_space, gb, install_redists, prefix_pids, run, run_inno, which_path, Game, Report};
+use crate::{check, find_md5, find_setup, gb, install_redists, need_space, run, run_inno, which_path, Game, Report};
 use serde::{Deserialize, Serialize};
 use anyhow::{anyhow, bail, Context, Result};
 use std::{cmp::Ordering, path::{Path, PathBuf}, process::{Command, Stdio}, time::SystemTime};
@@ -259,9 +259,7 @@ fn copy_tree(from: &Path, to: &Path, n: &mut usize, log: &impl Report) -> Result
 /// Every update's installer shows its window and waits for the user's click: never silent. With `backup`,
 /// the files it changes are copied first (`undo`).
 pub fn apply(g: &Game, u: &Update, verify_first: bool, backup: bool, log: &impl Report) -> Result<()> {
-    if !crate::game_pids(g).is_empty() {
-        bail!("{} is running: an update over a running game can leave half-written files. Close it, or press Stop game on its page.", g.name);
-    }
+    crate::ensure_stopped(g).map_err(|e| anyhow!("{e} An update over a running game can leave half-written files."))?;
     let backup = backup.then_some(u.to.as_str());
     // no size-based progress: the game folder is already full size, so the bar would sit at 100%
     let g = &Game { size: None, ..g.clone() };
@@ -292,11 +290,7 @@ fn extract(archive: &Path, to: &Path, prefix: &Path, log: &impl Report) -> Resul
             }
         })
         .filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum();
-    if let Some(free) = free_space(to)
-        && free < packed + (1 << 30)
-    {
-        bail!("not enough space to unpack the update: needs about {}, {} free at {}", gb(packed), gb(free), to.display());
-    }
+    need_space(to, packed, 1 << 30).map_err(|e| anyhow!("{e} (to unpack the update)"))?;
     log.step("Extracting the update archive");
     // 7-Zip reads RAR5 and multi-part archives and is in Arch's extra; unrar as a fallback
     let mut c = if let Some(z) = which_path("7z") {
@@ -313,7 +307,7 @@ fn extract(archive: &Path, to: &Path, prefix: &Path, log: &impl Report) -> Resul
     c.stdin(Stdio::null()); // a password prompt must fail, not wait
     // Cancel and closing repackd stop a job's processes by their WINEPREFIX: tag 7-Zip so they stop it too
     c.env("WINEPREFIX", prefix);
-    let st = run(c, log)?;
+    let st = run(c, None, log)?;
     if !st.success() {
         bail!("could not unpack {} ({st})", archive.display());
     }
@@ -527,12 +521,10 @@ fn snapshot(g: &Game, to: &str, rels: Vec<String>, whole: bool, log: &impl Repor
             log.log(format!("no backup: this patcher does not say which files it changes, and copying the whole game would take {}", gb(need)));
             return Ok(None);
         }
-        if let Some(free) = free_space(&root)
-            && free < need + (1 << 30)
-        {
+        need_space(&root, need, 1 << 30).map_err(|e| {
             let _ = std::fs::remove_dir_all(&root);
-            bail!("no room to back up the files this update changes: needs {}, {} free at {}. Free some space, or turn off \"Back up before updating\" in Settings", gb(need), gb(free), root.display());
-        }
+            anyhow!("no room to back up the files this update changes: {e}. Free some space, or turn off \"Back up before updating\" in Settings")
+        })?;
     }
     log.step("Backing up the files the update changes");
     let r = (|| {
@@ -592,9 +584,7 @@ pub fn undo(g: &Game, log: &impl Report) -> Result<(String, String)> {
     if !can_undo(g, &m) {
         bail!("the newest backup is from v{} to v{}, but the game is at v{}: it can't be undone safely", m.from, m.to, g.version);
     }
-    if !prefix_pids(&g.prefix()).is_empty() {
-        bail!("{} is running. Close it, or press Stop game on its page.", g.name);
-    }
+    crate::ensure_stopped(g)?;
     log.step(&format!("Undoing the update to v{}", m.to));
     let inst = g.install_dir();
     for f in &m.files {
@@ -627,7 +617,7 @@ fn gui_patch(g: &Game, exe: &Path, log: &impl Report) -> Result<()> {
     let start = SystemTime::now();
     let mut c = g.umu();
     c.current_dir(exe.parent().unwrap_or(exe)).arg(exe);
-    let st = run(c, log)?;
+    let st = run(c, g.exe.as_deref(), log)?;
     if !changed_since(&g.install_dir(), start) {
         bail!("the patcher changed no game files ({st}): apply the update again and pick {}", g.install_dir_win());
     }

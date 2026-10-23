@@ -90,7 +90,7 @@ The `repackd.desktop` copy is optional. Make sure `~/.local/bin` is in your `PAT
 ### Install
 1. Press "INSTALL" on the game's page. It shows the disk space it needs.
 2. With "Check the files before and after installing (FitGirl's checksums)" on (default), the files are verified first. Bad files are reported.
-3. By default the installer runs without its own windows. Turn off "Install games without the installer's own windows" in Settings to click through them yourself. Update installers always show their windows.
+3. By default the installer runs without its own windows. Turn off "Install games without the installer's own windows" in Settings to click through them yourself. Update installers show their windows, except FitGirl's own (see Updates).
 4. If an install fails, press "INSTALL AGAIN". The log is in Settings.
 5. Already-unpacked games show "SET UP", which only creates the Wine prefix.
 
@@ -109,6 +109,7 @@ Press "Game settings" on the game page.
 1. Put the update folders (FitGirl) or archives (scene .rar/.7z/.zip) next to the game or in Downloads.
 2. A game with an update shows "Update available" and a "Review" button. You can also press "Check for updates", "Add update folders…" or "Add update archives…" in Game settings, Updates.
 3. Check the order, then press "Apply". Updates run oldest first. The installer window appears and waits for your click.
+FitGirl's own updates install without a window (like her base repacks), and RUNE updates are checked before their window opens: a game whose files differ from what RUNE expects is refused with those files named.
 HDiffPatch updates (PATCH.exe + Patch.bin) are applied natively; repackd downloads the official hpatchz once if it isn't installed.
 4. With "Back up the files an update changes, so it can be undone" on (default), "Undo update to v…" puts the files back.
 

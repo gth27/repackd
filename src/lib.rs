@@ -1706,6 +1706,37 @@ fn md5_file(p: &Path, buf: &mut [u8], log: &impl Report) -> Result<String> {
     }))
 }
 
+const CRC32C: [u32; 256] = {
+    let (mut t, mut i) = ([0u32; 256], 0);
+    while i < 256 {
+        let (mut c, mut k) = (i as u32, 0);
+        while k < 8 {
+            c = if c & 1 != 0 { c >> 1 ^ 0x82F6_3B78 } else { c >> 1 };
+            k += 1;
+        }
+        t[i] = c;
+        i += 1;
+    }
+    t
+};
+
+/// CRC32C (Castagnoli) of a file, the sum RUNE's installer script checks (no crate has it; ~20 lines).
+pub(crate) fn crc32c_file(p: &Path, buf: &mut [u8], log: &impl Report) -> std::io::Result<u32> {
+    let mut f = std::fs::File::open(p)?;
+    let (mut crc, mut done) = (!0u32, 0u64);
+    loop {
+        let n = f.read(buf)?;
+        if n == 0 {
+            return Ok(!crc);
+        }
+        done += n as u64;
+        if done % (64 << 20) < n as u64 && log.cancelled() {
+            return Err(std::io::Error::other("cancelled"));
+        }
+        crc = buf[..n].iter().fold(crc, |c, &b| c >> 8 ^ CRC32C[(c as u8 ^ b) as usize]);
+    }
+}
+
 /// Check every file the `.md5` lists; returns the bad ones ("mismatch: x" / "missing: x").
 /// Files are hashed on up to 8 threads: a repack is a handful of multi-GB bins, an installed game thousands of
 /// small files, and one thread leaves a 4 GB check twice as slow as `md5sum`. Results keep the file's order.
@@ -3202,6 +3233,17 @@ mod tests {
         let b = b"a *..\\KCD II \x96 OST\\caf\xe9.mp3".to_vec();
         assert_eq!(decode_ansi(b), "a *..\\KCD II – OST\\café.mp3");
         assert_eq!(decode_ansi("ü – ok".as_bytes().to_vec()), "ü – ok"); // already UTF-8: untouched
+    }
+
+    #[test]
+    fn crc32c_vectors() {
+        let d = tmp("crc32c");
+        let mut buf = vec![0; 4]; // tiny buffer: the sum must not depend on read sizes
+        for (data, want) in [(&b"123456789"[..], 0xE306_9283u32), (b"", 0)] {
+            std::fs::write(d.join("f"), data).unwrap();
+            assert_eq!(crc32c_file(&d.join("f"), &mut buf, &|_| {}).unwrap(), want);
+        }
+        std::fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]

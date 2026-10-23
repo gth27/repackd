@@ -156,7 +156,7 @@ enum Job {
     Winetricks(Vec<String>),
     /// A mod installer, trainer or patcher, run with the game's Proton in its prefix.
     RunExe(PathBuf),
-    Updates { ups: Vec<Update>, verify: bool, backup: bool },
+    Updates { ups: Vec<Update>, verify: bool, backup: bool, unattended: bool },
     /// Put back the files of the newest backed-up update.
     UndoUpdate,
     /// Delete the game (saves backed up first), then drop it from the library.
@@ -948,12 +948,12 @@ impl App {
                 }),
                 Job::RestoreSaves(p) => crate::restore_saves(&g, &p).map(|()| _ = tx.send(Ev::Note(Some(g.dir.clone()), format!("Saves restored from {}", p.display()), false))),
                 Job::Import => crate::prepare_import(&g, &report).map(|()| _ = tx.send(Ev::Note(Some(g.dir.clone()), "Ready to play.".into(), false))),
-                Job::Updates { ups, verify, backup } => (|| {
+                Job::Updates { ups, verify, backup, unattended } => (|| {
                     let mut g = g.clone();
                     for u in &ups {
                         let name = u.dir.file_name().unwrap_or_default().to_string_lossy().into_owned();
                         log(format!("applying {name}"));
-                        update::apply(&g, u, verify, backup, &report)?;
+                        update::apply(&g, u, verify, backup, unattended, &report)?;
                         g.version = u.to.clone(); // the next update's backup records this as its "before"
                         let _ = tx.send(Ev::Applied(g.dir.clone(), u.to.clone(), format!("v{} ({name})", u.to)));
                     }
@@ -1300,9 +1300,9 @@ impl App {
             {
                 let why = if !installed { "install the game first" } else if self.no_umu { "umu-launcher is missing" } else { "this game's job is running" };
                 let label = format!("{} {} update(s)", if self.busy { "Queue" } else { "Apply" }, ups.len());
-                if ui.add_enabled(!self.busy_with(&g) && !self.queued(&g) && !self.no_umu && installed, egui::Button::new(label)).on_hover_text("A setup window will open: click Next / Install / Finish in it.").on_disabled_hover_text(why).clicked() {
+                if ui.add_enabled(!self.busy_with(&g) && !self.queued(&g) && !self.no_umu && installed, egui::Button::new(label)).on_hover_text("TENOKE patches and FitGirl updates install without a window; other installers open one: click Next / Install / Finish in it (pick drive G: if it asks where the game is).").on_disabled_hover_text(why).clicked() {
                     let ups = std::mem::replace(&mut self.pending, Ok(vec![])).unwrap_or_default();
-                    self.spawn(&ctx, g.clone(), Job::Updates { ups, verify: self.settings.verify, backup: self.settings.backup_updates });
+                    self.spawn(&ctx, g.clone(), Job::Updates { ups, verify: self.settings.verify, backup: self.settings.backup_updates, unattended: self.settings.unattended });
                 }
             }
             if has_plan && ui.button("Clear").clicked() {

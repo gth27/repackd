@@ -256,20 +256,20 @@ fn copy_tree(from: &Path, to: &Path, n: &mut usize, log: &impl Report) -> Result
 }
 
 /// Install one update into the game. An archive is unpacked next to the game first (and removed after).
-/// Every update's installer shows its window and waits for the user's click: never silent. With `backup`,
+/// Update installers show their window and wait for the user's click, except FitGirl's with `unattended`. With `backup`,
 /// the files it changes are copied first (`undo`).
-pub fn apply(g: &Game, u: &Update, verify_first: bool, backup: bool, log: &impl Report) -> Result<()> {
+pub fn apply(g: &Game, u: &Update, verify_first: bool, backup: bool, unattended: bool, log: &impl Report) -> Result<()> {
     crate::ensure_stopped(g).map_err(|e| anyhow!("{e} An update over a running game can leave half-written files."))?;
     let backup = backup.then_some(u.to.as_str());
     // no size-based progress: the game folder is already full size, so the bar would sit at 100%
     let g = &Game { size: None, ..g.clone() };
     if !u.dir.is_file() {
-        return apply_dir(g, &u.dir, false, verify_first, backup, log);
+        return apply_dir(g, &u.dir, false, verify_first, backup, unattended, log);
     }
     let tmp = g.dir.join("update-tmp");
     let r = (|| {
         extract(&u.dir, &tmp, &g.prefix(), log)?;
-        apply_dir(g, &content_root(&tmp), true, verify_first, backup, log)
+        apply_dir(g, &content_root(&tmp), true, verify_first, backup, unattended, log)
     })();
     let _ = std::fs::remove_dir_all(&tmp);
     r
@@ -333,7 +333,7 @@ fn content_root(d: &Path) -> PathBuf {
 /// - FitGirl: `setup.exe` (Inno, same dir and prefix as the game), or plain files copied over the install dir;
 /// - scene: the installer in `Update/` (Inno `setup.exe`, or a `PATCH.exe` with a window), then every other
 ///   folder (`Crack`, or the group's name like `RUNE`) copied over the install dir, as their nfo says.
-fn apply_dir(g: &Game, dir: &Path, archive: bool, verify_first: bool, backup: Option<&str>, log: &impl Report) -> Result<()> {
+fn apply_dir(g: &Game, dir: &Path, archive: bool, verify_first: bool, backup: Option<&str>, unattended: bool, log: &impl Report) -> Result<()> {
     let md5 = find_md5(dir);
     if verify_first && let Some(f) = &md5 {
         check(f, log).map_err(|e| anyhow!("{e}. Get the update files again."))?;
@@ -343,6 +343,7 @@ fn apply_dir(g: &Game, dir: &Path, archive: bool, verify_first: bool, backup: Op
     // (an unpacked TENOKE folder with PATCH.exe counts too: copying its patcher into the game would do nothing)
     let top_installer = md5.is_none() && (patch_exe(dir).is_some() || (archive && find_setup(dir).is_ok()));
     let scene = sub("update").or_else(|| top_installer.then(|| dir.to_path_buf()));
+    precheck(g, scene.as_deref(), log)?; // before the undo snapshot: a refusal costs no disk
     if let Some(to) = backup {
         // what will change: the installer's own file list, the files to copy, or (a patcher that names
         // none) the whole game; plus the crack's files
@@ -360,7 +361,7 @@ fn apply_dir(g: &Game, dir: &Path, archive: bool, verify_first: bool, backup: Op
         }
         let root = snapshot(g, to, rels, whole, log)?;
         let start = SystemTime::now();
-        let r = run_update(g, dir, scene, log);
+        let r = run_update(g, dir, scene, unattended, log);
         if let Some(root) = root {
             if r.is_err() && !changed_since(&g.install_dir(), start) {
                 // the update failed before touching the game: its undo copy (maybe the whole game) is dead weight
@@ -374,15 +375,100 @@ fn apply_dir(g: &Game, dir: &Path, archive: bool, verify_first: bool, backup: Op
         }
         return r;
     }
-    run_update(g, dir, scene, log)
+    run_update(g, dir, scene, unattended, log)
+}
+
+/// RUNE's installer lists the old files it patches with their CRC32C: refuse early when the game differs.
+fn precheck(g: &Game, scene: Option<&Path>, log: &impl Report) -> Result<()> {
+    match scene.and_then(|s| find_setup(s).ok()).and_then(|s| rune_list(&s)) {
+        Some(list) => rune_precheck(&g.install_dir(), &list, log),
+        None => Ok(()),
+    }
+}
+
+/// The (CRC32C of the old file, path relative to the game) pairs in the Inno script of a RUNE `Setup.exe`.
+/// Layout (PLAN.md "RUNE format spec"): the compiled IFPS script pushes `01 0a 00 00 00 <u32 crc>` then, a few
+/// opcodes later, the string `01 11 00 00 00 <u32 len> "{app}\path"`; None when it isn't that.
+fn rune_list(setup: &Path) -> Option<Vec<(u32, String)>> {
+    let h = crate::read_capped(setup, 64 << 20).ok().and_then(|b| crate::setup_header(&b))?;
+    let u32_at = |i: usize| h.get(i..i + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    let (pfx, mut out) = (br"{app}\", vec![]);
+    for i in h.windows(pfx.len()).enumerate().filter(|(_, w)| w == pfx).map(|(i, _)| i) {
+        let Some(m) = i.checked_sub(9).filter(|&m| h[m..m + 5] == [1, 0x11, 0, 0, 0]) else { continue };
+        let len = u32_at(m + 5)? as usize;
+        let Some(path) = h.get(i..i + len).and_then(|p| std::str::from_utf8(&p[pfx.len()..]).ok()) else { continue };
+        // the constant is the last "push u32" within 40 bytes before the string
+        let Some(c) = (m.saturating_sub(40)..m).rev().find(|&c| h[c..c + 5] == [1, 0x0a, 0, 0, 0]) else { continue };
+        let rel = path.replace('\\', "/");
+        if rel.is_empty() || rel.starts_with('/') || rel.split('/').any(|c| c == "..") {
+            continue; // never let a crafted script point outside the game
+        }
+        out.push((u32_at(c + 5)?, rel));
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// Hash the listed game files (parallel, low priority, like `verify`); refuse when any differs or is missing.
+fn rune_precheck(root: &Path, list: &[(u32, String)], log: &impl Report) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+    log.step(&format!("Checking the game files RUNE's update needs ({} files)", list.len()));
+    let total: u64 = list.iter().filter_map(|(_, r)| std::fs::metadata(root.join(r)).ok()).map(|m| m.len()).sum();
+    let (hashed, next, bad) = (AtomicU64::new(0), AtomicUsize::new(0), std::sync::Mutex::new(vec![]));
+    std::thread::scope(|s| {
+        for _ in 0..std::thread::available_parallelism().map_or(4, |n| n.get()).min(8) {
+            s.spawn(|| {
+                unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 10) }; // a game may be running meanwhile
+                let mut buf = vec![0; 1 << 20];
+                while !log.cancelled() {
+                    let n = next.fetch_add(1, Relaxed);
+                    let Some((want, rel)) = list.get(n) else { break };
+                    let p = root.join(rel);
+                    let r = crate::crc32c_file(&p, &mut buf, log);
+                    let size = std::fs::metadata(&p).map_or(0, |m| m.len());
+                    log.progress(hashed.fetch_add(size, Relaxed) + size, total.max(1));
+                    match r {
+                        Ok(got) if got == *want => {}
+                        Ok(_) => bad.lock().unwrap().push((n, format!("{rel} (changed)"))),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => bad.lock().unwrap().push((n, format!("{rel} (missing)"))),
+                        Err(e) => bad.lock().unwrap().push((n, format!("{rel} (unreadable: {e})"))),
+                    }
+                }
+            });
+        }
+    });
+    crate::cancel_point(log)?;
+    let mut bad = bad.into_inner().unwrap();
+    bad.sort();
+    if bad.is_empty() {
+        return Ok(());
+    }
+    bad.iter().for_each(|(_, m)| log.log(format!("differs from RUNE's expected version: {m}")));
+    let shown: String = bad.iter().take(10).map(|(_, m)| format!("\n  {m}")).collect();
+    bail!("This update can't be applied: {} file(s) differ from the version RUNE expects:{shown}\nRestore those files from the original release, or use an update made for your version (e.g. FitGirl's).", bad.len())
+}
+
+/// FitGirl built this update: her setup header names her, or it ships her checksum list or fg-*.bin files.
+fn fitgirl_update(dir: &Path, setup: &Path) -> bool {
+    let names = |d: &Path| std::fs::read_dir(d).into_iter().flatten().flatten().map(|e| e.file_name().to_string_lossy().to_ascii_lowercase()).collect::<Vec<_>>();
+    let by_name = names(dir).iter().any(|n| (n.starts_with("fg-") || n.starts_with("fitgirl-")) && n.ends_with(".bin"))
+        || names(&dir.join("MD5")).iter().any(|n| n.starts_with("fitgirl") && n.ends_with(".md5"));
+    by_name || crate::read_capped(setup, 64 << 20).ok().and_then(|b| crate::setup_header(&b)).is_some_and(|h| {
+        let w: Vec<u8> = b"fitgirl".iter().flat_map(|&c| [c, 0]).collect();
+        let has = |n: &[u8]| h.windows(n.len()).any(|x| x.eq_ignore_ascii_case(n));
+        has(b"fitgirl") || has(&w)
+    })
 }
 
 /// Run the update's installer (or copy its files), then its crack.
-fn run_update(g: &Game, dir: &Path, scene: Option<PathBuf>, log: &impl Report) -> Result<()> {
+fn run_update(g: &Game, dir: &Path, scene: Option<PathBuf>, unattended: bool, log: &impl Report) -> Result<()> {
     crate::cancel_point(log)?;
     let Some(scene) = scene else {
         if let Ok(setup) = find_setup(dir) {
-            run_inno(g, &setup, false, log)?;
+            let quiet = unattended && fitgirl_update(dir, &setup);
+            if quiet {
+                log.log("FitGirl update: installing without its window".into());
+            }
+            run_inno(g, &setup, quiet, log)?;
             return install_redists(g, log); // blocked during its setup like the base game's
         }
         return copy_files(g, dir, log);
@@ -720,6 +806,57 @@ mod tests {
     }
 
     #[test]
+    fn fitgirl_update_markers() {
+        let d = std::env::temp_dir().join(format!("repackd-fgup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("a/MD5")).unwrap();
+        std::fs::create_dir_all(d.join("b")).unwrap();
+        std::fs::create_dir_all(d.join("c")).unwrap();
+        for f in ["a/MD5/fitgirl-bins.md5", "b/fg-01.bin", "c/setup.exe"] {
+            std::fs::write(d.join(f), b"x").unwrap();
+        }
+        let s = d.join("c/setup.exe"); // not an Inno exe: the header part just says no
+        assert!(fitgirl_update(&d.join("a"), &s) && fitgirl_update(&d.join("b"), &s));
+        assert!(!fitgirl_update(&d.join("c"), &s));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn unattended_reaches_inno_args() {
+        assert!(crate::inno_args("G:\\x", true).contains(&"/VERYSILENT".to_string()));
+        assert!(!crate::inno_args("G:\\x", false).contains(&"/VERYSILENT".to_string()));
+    }
+
+    #[test]
+    fn rune_real_setup_list() {
+        let Some(h) = std::env::var_os("HOME") else { return };
+        let exe = Path::new(&h).join("repackd-sandbox-test/rune/rel/Update/Setup.exe");
+        if !exe.exists() {
+            eprintln!("no RUNE Setup.exe here: skipped");
+            return;
+        }
+        let l = rune_list(&exe).unwrap();
+        eprintln!("{} pairs, first: {:x?}", l.len(), &l[..3]);
+        assert_eq!(l.len(), 116);
+        assert!(l.contains(&(0x2fdc8804, "Engine/ShadersBin.pak".into())));
+    }
+
+    #[test]
+    fn rune_precheck_names_bad_files() {
+        let d = std::env::temp_dir().join(format!("repackd-rune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("Data")).unwrap();
+        std::fs::write(d.join("Data/a.pak"), b"123456789").unwrap();
+        std::fs::write(d.join("Data/b.pak"), b"x").unwrap();
+        let l = |c: u32, p: &str| (c, p.to_string());
+        let ok = [l(0xE306_9283, "Data/a.pak")];
+        rune_precheck(&d, &ok, &|_| {}).unwrap();
+        let e = rune_precheck(&d, &[ok[0].clone(), l(1, "Data/b.pak"), l(2, "Data/gone.pak")], &|_| {}).unwrap_err().to_string();
+        assert!(e.contains("2 file(s)") && e.contains("Data/b.pak (changed)") && e.contains("Data/gone.pak (missing)") && !e.contains("a.pak"), "{e}");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
     fn version_tokens() {
         assert_eq!(versions("Cyberpunk 2077 v2.12 + DLC"), ["2.12"]);
         assert_eq!(versions("Update v1.04 to v1.05.1"), ["1.04", "1.05.1"]);
@@ -879,7 +1016,7 @@ mod tests {
         std::fs::write(u.join("Data/b.pak"), b"added").unwrap();
         std::fs::create_dir_all(u.join("data")).unwrap();
         std::fs::write(u.join("data/new.txt"), b"x").unwrap();
-        apply(&g, &parse(&u).unwrap(), false, true, &|_| {}).unwrap();
+        apply(&g, &parse(&u).unwrap(), false, true, false, &|_| {}).unwrap();
         assert_eq!(std::fs::read(inst.join("Data/a.pak")).unwrap(), b"new");
         let (b, _) = last_backup(&g).unwrap();
         assert_eq!((b.from.as_str(), b.to.as_str()), ("1.0", "1.1"));
@@ -907,7 +1044,7 @@ mod tests {
         std::fs::create_dir_all(g.install_dir().join("data")).unwrap();
         std::fs::write(g.install_dir().join("data/patch.pak"), b"old").unwrap();
         std::os::unix::fs::symlink(&u, u.join("data/loop")).unwrap(); // a link back up must not be walked forever
-        apply(&g, &parse(&u).unwrap(), true, false, &|_| {}).unwrap();
+        apply(&g, &parse(&u).unwrap(), true, false, false, &|_| {}).unwrap();
         assert_eq!(std::fs::read(g.install_dir().join("data/patch.pak")).unwrap(), b"new");
         assert!(!g.install_dir().join("readme.txt").exists() && !g.install_dir().join("MD5").exists());
         std::fs::remove_dir_all(&d).unwrap();

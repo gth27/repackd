@@ -392,7 +392,15 @@ fn run_update(g: &Game, dir: &Path, scene: Option<PathBuf>, log: &impl Report) -
         log.log(format!("In the update's window check the folder is {} (drive G:) and press Install; repackd copies the crack afterwards.", g.install_dir_win()));
         run_inno(g, &setup, false, log)?;
     } else if let Some(patch) = patch_exe(&scene) {
-        gui_patch(g, &patch, log)?;
+        match hdiff_patch(&scene).map(|bin| crate::hpatchz(log).map(|hz| (hz, bin))) {
+            Some(Ok((hz, bin))) => native_patch(g, &hz, &bin, log)?,
+            other => {
+                if let Some(Err(e)) = other {
+                    log.log(format!("native HDiffPatch unavailable ({e}); using the patcher's window"));
+                }
+                gui_patch(g, &patch, log)?;
+            }
+        }
     } else {
         bail!("{} has neither setup.exe nor PATCH.exe", scene.display());
     }
@@ -401,6 +409,39 @@ fn run_update(g: &Game, dir: &Path, scene: Option<PathBuf>, log: &impl Report) -
 
 fn patch_exe(dir: &Path) -> Option<PathBuf> {
     std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).find(|p| p.file_name().is_some_and(|n| n.eq_ignore_ascii_case("patch.exe")))
+}
+
+/// `Patch.bin` beside PATCH.exe when it is an HDiffPatch diff (starts with `HDIFF`).
+fn hdiff_patch(dir: &Path) -> Option<PathBuf> {
+    use std::io::Read;
+    let bin = std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).find(|p| p.file_name().is_some_and(|n| n.eq_ignore_ascii_case("patch.bin")))?;
+    let mut magic = [0u8; 5];
+    std::fs::File::open(&bin).ok()?.read_exact(&mut magic).ok()?;
+    (&magic == b"HDIFF").then_some(bin)
+}
+
+/// hpatchz patches the folder over itself: the result replaces the old files only when it is whole.
+fn hpatchz_args(inst: &Path, bin: &Path) -> Vec<std::ffi::OsString> {
+    vec!["-C-all".into(), "-f".into(), inst.into(), bin.into(), inst.into()]
+}
+
+/// An HDiffPatch `Patch.bin` applied with hpatchz: no window, no drive picking.
+fn native_patch(g: &Game, hpatchz: &Path, bin: &Path, log: &impl Report) -> Result<()> {
+    log.step(&format!("Patching {} (HDiffPatch, no window needed)", g.name));
+    let inst = g.install_dir();
+    // shortcut: the new data size is not known up front, so the diff's size plus 1 GB stands in; read it from the diff's header to be exact
+    need_space(&inst, std::fs::metadata(bin)?.len(), 1 << 30)?;
+    let start = SystemTime::now();
+    let mut c = Command::new(hpatchz);
+    c.args(hpatchz_args(&inst, bin));
+    let st = run(c, None, log)?;
+    if !st.success() {
+        bail!("hpatchz failed ({st}): see its output above; the game files are unchanged unless it said otherwise");
+    }
+    if !changed_since(&inst, start) {
+        bail!("the patch changed no game files");
+    }
+    Ok(())
 }
 
 /// The folders of a scene release besides the installer's: its crack (`Crack`, `RUNE`, ...).
@@ -793,6 +834,21 @@ mod tests {
         let dispatch = Game { name: "Dispatch".into(), repack_dir: d.join("Dispatch"), dir: d.join("g2"), version: "1.0".into(), ..Default::default() };
         assert_eq!(find_for(&dispatch).unwrap().len(), 1);
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn hdiff_patch_needs_the_magic() {
+        let d = std::env::temp_dir().join(format!("repackd-hdiff-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        assert!(hdiff_patch(&d).is_none(), "no Patch.bin");
+        std::fs::write(d.join("Patch.bin"), "PK\x03\x04 not a diff").unwrap();
+        assert!(hdiff_patch(&d).is_none());
+        std::fs::write(d.join("Patch.bin"), "HDIFF19&&fadler64").unwrap();
+        assert!(hdiff_patch(&d).is_some());
+        std::fs::remove_dir_all(&d).unwrap();
+        let a = hpatchz_args(Path::new("/g"), Path::new("/u/Patch.bin"));
+        assert_eq!(a, ["-C-all", "-f", "/g", "/u/Patch.bin", "/g"]);
     }
 
     #[test]

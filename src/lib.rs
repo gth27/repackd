@@ -1021,6 +1021,66 @@ fn releases_from(source: &'static str, v: &serde_json::Value) -> Result<Vec<Prot
 /// Protocols curl may use for downloads named by GitHub's answers (tests download from local files).
 const PROTO: &str = if cfg!(test) { "=https,file" } else { "=https" };
 
+// the official HDiffPatch build (sisong/HDiffPatch v4.6.8, linux64) and the SHA-256 of its zip and of the binary in it
+const HDIFF_URL: &str = "https://github.com/sisong/HDiffPatch/releases/download/v4.6.8/hdiffpatch_v4.6.8_bin_linux64.zip";
+const HDIFF_ZIP_SHA: &str = "0c09e10627ec34751a7ae23e62f4f3cc22365a44acc6c108a60ce19d47a21a62";
+const HDIFF_BIN_SHA: &str = "b53f0579394b83eb288a1e4458af704e9f8a385a0f8216f4d35b59a98c7e3dfe";
+
+fn sha256_is(file: &Path, want: &str) -> bool {
+    Command::new("sha256sum").arg(file).output().is_ok_and(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().next().is_some_and(|h| h.eq_ignore_ascii_case(want)))
+}
+
+/// `hpatchz` for HDiffPatch updates: the one on PATH, else the pinned official build, downloaded once into the tools dir.
+pub fn hpatchz(log: &impl Report) -> Result<PathBuf> {
+    if let Some(p) = which_path("hpatchz") {
+        return Ok(p);
+    }
+    let dir = data_home().join("repackd/tools");
+    let bin = dir.join("hpatchz");
+    if sha256_is(&bin, HDIFF_BIN_SHA) {
+        return Ok(bin);
+    }
+    if !cfg!(target_arch = "x86_64") {
+        bail!("the official hpatchz build is x86_64 only: install hpatchz");
+    }
+    let Some(z7) = which_path("7z") else { bail!("unpacking hpatchz needs 7-Zip: {}", install_hint("7z")) };
+    std::fs::create_dir_all(&dir)?;
+    let (zip, stage) = (dir.join(".hdiffpatch.zip"), dir.join(".hdiffpatch.unpack"));
+    log.log("downloading HDiffPatch (hpatchz, 0.3 MB) once".into());
+    let result = (|| {
+        let mut child = Command::new("curl").args(["-sSfL", "--proto", PROTO, "--speed-limit", "1024", "--speed-time", "60", "-o"]).arg(&zip).arg("--").arg(HDIFF_URL).spawn().context("start curl")?;
+        let st = loop {
+            if let Some(st) = child.try_wait()? {
+                break st;
+            }
+            if log.cancelled() {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("cancelled");
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        };
+        if !st.success() {
+            bail!("download failed ({st})");
+        }
+        if !sha256_is(&zip, HDIFF_ZIP_SHA) {
+            bail!("the hpatchz download does not match its pinned checksum");
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+        let o = Command::new(z7).args(["x", "-y", "-bd"]).arg(format!("-o{}", stage.display())).arg(&zip).arg("linux64/hpatchz").output()?;
+        let got = stage.join("linux64/hpatchz");
+        if !o.status.success() || !sha256_is(&got, HDIFF_BIN_SHA) {
+            bail!("unpacked hpatchz does not match its pinned checksum");
+        }
+        std::fs::set_permissions(&got, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
+        std::fs::rename(&got, &bin)?;
+        Ok(bin.clone())
+    })();
+    let _ = std::fs::remove_file(&zip);
+    let _ = std::fs::remove_dir_all(&stage);
+    result
+}
+
 /// Download a Proton release, check it against its published SHA-512/256 sum, and unpack it into `compat_dir`.
 pub fn install_proton(rel: &ProtonRelease, dir: &Path, log: &impl Report) -> Result<()> {
     std::fs::create_dir_all(dir)?;
@@ -2705,6 +2765,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn sha256_check_rejects_wrong_file() {
+        let d = tmp("sha");
+        let f = d.join("f");
+        std::fs::write(&f, "abc").unwrap();
+        assert!(sha256_is(&f, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+        assert!(!sha256_is(&f, HDIFF_BIN_SHA) && !sha256_is(&d.join("missing"), HDIFF_BIN_SHA));
     }
 
     #[test]

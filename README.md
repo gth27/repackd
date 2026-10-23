@@ -109,6 +109,7 @@ Press "Game settings" on the game page.
 1. Put the update folders (FitGirl) or archives (scene .rar/.7z/.zip) next to the game or in Downloads.
 2. A game with an update shows "Update available" and a "Review" button. You can also press "Check for updates", "Add update folders…" or "Add update archives…" in Game settings, Updates.
 3. Check the order, then press "Apply". Updates run oldest first. The installer window appears and waits for your click.
+HDiffPatch updates (PATCH.exe + Patch.bin) are applied natively; repackd downloads the official hpatchz once if it isn't installed.
 4. With "Back up the files an update changes, so it can be undone" on (default), "Undo update to v…" puts the files back.
 
 ### Steam

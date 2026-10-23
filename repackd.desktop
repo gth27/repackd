@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=repackd
+GenericName=Repack Installer
+Comment=Install and play local game repacks with Proton or emulators
+Exec=repackd
+Icon=applications-games
+Terminal=false
+Categories=Game;
+Keywords=fitgirl;repack;proton;wine;installer;games;
+StartupWMClass=repackd

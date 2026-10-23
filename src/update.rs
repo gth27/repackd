@@ -2,7 +2,7 @@
 //! ("Game.Update.v1.5.2-RUNE.part1.rar": a patcher in `Update/`, a crack beside it) applied in version order.
 use crate::{check, find_md5, find_setup, free_space, gb, install_redists, prefix_pids, run, run_inno, which_path, Game, Report};
 use serde::{Deserialize, Serialize};
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::{cmp::Ordering, path::{Path, PathBuf}, process::{Command, Stdio}, time::SystemTime};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -342,7 +342,7 @@ fn content_root(d: &Path) -> PathBuf {
 fn apply_dir(g: &Game, dir: &Path, archive: bool, verify_first: bool, backup: Option<&str>, log: &impl Report) -> Result<()> {
     let md5 = find_md5(dir);
     if verify_first && let Some(f) = &md5 {
-        check(f, log).context("the update's files are damaged")?;
+        check(f, log).map_err(|e| anyhow!("{e}. Get the update files again."))?;
     }
     let sub = |name: &str| std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).find(|p| p.is_dir() && p.file_name().is_some_and(|n| n.eq_ignore_ascii_case(name)));
     // a scene archive with its installer at the top (no Update/ folder); FitGirl's always ship a checksum list
@@ -379,7 +379,7 @@ fn run_update(g: &Game, dir: &Path, scene: Option<PathBuf>, log: &impl Report) -
     crate::cancel_point(log)?;
     let Some(scene) = scene else {
         if let Ok(setup) = find_setup(dir) {
-            log.step("Updating: click through the update's installer");
+            log.step("Updating: a setup window will open: click Next / Install / Finish in it.");
             run_inno(g, &setup, false, log)?;
             return install_redists(g, log); // blocked during its setup like the base game's
         }
@@ -387,7 +387,7 @@ fn run_update(g: &Game, dir: &Path, scene: Option<PathBuf>, log: &impl Report) -
     };
     if let Ok(setup) = find_setup(&scene) {
         // the Inno log still says whether it finished (RUNE's own page aborts when run silently anyway)
-        log.step("Updating: press Install in the update's window");
+        log.step("Updating: a setup window will open: click Next / Install / Finish in it.");
         log.log(format!("In the update's window check the folder is {} and press Install; repackd copies the crack afterwards.", g.install_dir_win()));
         run_inno(g, &setup, false, log)?;
     } else if let Some(patch) = patch_exe(&scene) {

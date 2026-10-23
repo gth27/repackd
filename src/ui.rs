@@ -185,6 +185,10 @@ pub struct App {
     styled: bool,
     /// The game page shows that game's full settings (gear button) instead of the big Play page.
     easy_gear: bool,
+    /// "Show log" on a failed install: the settings page scrolls to its Log section once.
+    scroll_to_log: bool,
+    /// "SET UP EMULATOR" opened the global Settings: scroll to its Emulators section once.
+    scroll_to_emulators: bool,
     /// The global Settings page is open (top bar), and its SteamGridDB key field as typed.
     global: bool,
     /// The Disk usage page (inside the global Settings), its measured rows by game dir, and the repack delete waiting for "Yes".
@@ -297,6 +301,8 @@ impl App {
             confirm_restore: None,
             styled: false,
             easy_gear: false,
+            scroll_to_log: false,
+            scroll_to_emulators: false,
             global: false,
             disk_page: false,
             disk_rows: HashMap::new(),
@@ -903,6 +909,7 @@ impl App {
         };
         let grid = |id: &str| egui::Grid::new(id.to_string()).num_columns(2).spacing([18.0, 10.0]).min_col_width(170.0);
 
+        section(ui, "About");
         grid("about").show(ui, |ui| {
             row_label(ui, "Name");
             let r = ui.add(egui::TextEdit::singleline(&mut self.lib.games[i].name).desired_width(420.0));
@@ -994,11 +1001,7 @@ impl App {
                 }
             });
             ui.end_row();
-            if windows {
-                row_label(ui, "Proton");
-                self.proton_combo(ui, i);
-                ui.end_row();
-            } else {
+            if !windows {
                 let k = g.kind;
                 row_label(ui, match k {
                     Kind::Switch => "Switch emulator",
@@ -1038,27 +1041,9 @@ impl App {
                     }
                 });
                 ui.end_row();
-                if !imported {
-                    row_label(ui, "Proton for setup.exe");
-                    self.proton_combo(ui, i);
-                    ui.end_row();
-                }
             }
-            row_label(ui, "Launch options");
-            let hint = if windows { "e.g. -dx11 -skipintro" } else { "{file} is the game file" };
-            if ui.add(egui::TextEdit::singleline(&mut self.lib.games[i].args).hint_text(hint).desired_width(380.0)).lost_focus() {
-                self.save();
-                self.write_script(i);
-            }
-            ui.end_row();
-            ui.label("Environment");
-            if ui.add(egui::TextEdit::multiline(&mut self.lib.games[i].env).hint_text("one per line, e.g.\nDXVK_ASYNC=1").desired_rows(2).desired_width(380.0)).lost_focus() {
-                self.save();
-                self.write_script(i);
-            }
-            ui.end_row();
             // switches for the tools that are installed (FSR, the FPS counter and the GPU need none)
-            ui.label("Switches"); // top-aligned like "Environment", not centred on the tall stack
+            ui.label("Extras"); // top-aligned like the multi-line fields, not centred on the tall stack
             ui.vertical(|ui| {
                 // which tools are installed: looked up once, not every frame
                 static AVAILABLE: std::sync::OnceLock<Vec<bool>> = std::sync::OnceLock::new();
@@ -1080,15 +1065,6 @@ impl App {
                 }
             });
             ui.end_row();
-            row_label(ui, "Last run");
-            let out = g.dir.join("last-run.log");
-            if ui.add_enabled(self.side(&g).last_run, egui::Button::new("Show its output in the log")).on_disabled_hover_text("the game has not been started from repackd yet").clicked() {
-                let text = std::fs::read_to_string(&out).unwrap_or_default();
-                let lines: Vec<&str> = text.lines().collect();
-                self.log.push(format!("-- last run of {} ({} lines, the last 300 shown)", g.name, lines.len()));
-                self.log.extend(lines[lines.len().saturating_sub(300)..].iter().map(|l| l.to_string()));
-            }
-            ui.end_row();
             row_label(ui, "App menu");
             let mut on = g.desktop;
             if ui.checkbox(&mut on, "Show in the app menu").on_hover_text("a .desktop entry that runs this game's launch script").changed() {
@@ -1101,6 +1077,44 @@ impl App {
                 self.save();
             }
             ui.end_row();
+            row_label(ui, "Last run");
+            let out = g.dir.join("last-run.log");
+            if ui.add_enabled(self.side(&g).last_run, egui::Button::new("Why won't it start?")).on_disabled_hover_text("the game has not been started from repackd yet").clicked() {
+                let text = std::fs::read_to_string(&out).unwrap_or_default();
+                let lines: Vec<&str> = text.lines().collect();
+                self.log.push(format!("-- last run of {} ({} lines, the last 300 shown)", g.name, lines.len()));
+                self.log.extend(lines[lines.len().saturating_sub(300)..].iter().map(|l| l.to_string()));
+            }
+            ui.end_row();
+        });
+
+        ui.add_space(22.0);
+        egui::CollapsingHeader::new(RichText::new("Advanced").heading()).default_open(false).show(ui, |ui| {
+            grid("advanced").show(ui, |ui| {
+                    if windows {
+                        row_label(ui, "Compatibility version");
+                        self.proton_combo(ui, i);
+                        ui.end_row();
+                    }
+                    if !windows && !imported {
+                        row_label(ui, "Compatibility version (setup)");
+                        self.proton_combo(ui, i);
+                        ui.end_row();
+                    }
+                    row_label(ui, "Launch options");
+                    let hint = if windows { "e.g. -dx11 -skipintro" } else { "{file} is the game file" };
+                    if ui.add(egui::TextEdit::singleline(&mut self.lib.games[i].args).hint_text(hint).desired_width(380.0)).lost_focus() {
+                        self.save();
+                        self.write_script(i);
+                    }
+                    ui.end_row();
+                    ui.label("Extra settings (advanced)");
+                    if ui.add(egui::TextEdit::multiline(&mut self.lib.games[i].env).hint_text("one per line, e.g.\nDXVK_ASYNC=1").desired_rows(2).desired_width(380.0)).lost_focus() {
+                        self.save();
+                        self.write_script(i);
+                    }
+                    ui.end_row();
+            });
         });
 
         section(ui, "Steam");
@@ -1128,6 +1142,114 @@ impl App {
                     self.steam_edit(i, None);
                 }
             });
+        }
+
+        section(ui, "Updates");
+        if g.applied.is_empty() {
+            ui.label(RichText::new("No updates applied.").color(sub));
+        }
+        for a in &g.applied {
+            ui.label(format!("Applied {a}"));
+        }
+        if let Some((from, _)) = self.side(&g).undo.clone().filter(|(f, t)| [f, t].iter().any(|v| update::vcmp(v, &g.version) == std::cmp::Ordering::Equal)) {
+            ui.horizontal(|ui| {
+                if ui.add_enabled(idle, egui::Button::new(format!("Undo update (back to v{from})"))).on_hover_text(format!("puts the game files back as they were at v{from}")).clicked() {
+                    self.spawn(&ctx, g.clone(), Job::UndoUpdate);
+                }
+                if ui.add_enabled(idle, egui::Button::new(match &self.disk { Some((d, [.., b])) if *d == g.dir && *b > 0 => format!("Delete undo copies (frees {})", gb(*b)), _ => "Delete undo copies".to_string() })).on_hover_text("frees their space; updates can't be undone after this").clicked() {
+                    (self.side, self.disk) = (None, None);
+                    match update::delete_backups(&g) {
+                        Ok(()) => self.notify(Some(g.dir.clone()), "Update backups deleted.", false),
+                        Err(e) => self.say(format!("error: {e:#}")),
+                    }
+                }
+            });
+        }
+        ui.horizontal(|ui| {
+            let folders = ui.add_enabled(idle, egui::Button::new("Add update folders…")).on_hover_text("pick one or more FitGirl update folders; they are applied oldest first").clicked();
+            let archives = ui.add_enabled(idle, egui::Button::new("Add update archives…")).on_hover_text("scene updates as .rar/.7z/.zip (for a multi-part RAR pick its .part1.rar); unpacked, installed, then their crack copied in").clicked();
+            let picked = if folders {
+                rfd::FileDialog::new().set_title("Update folders").pick_folders()
+            } else if archives {
+                rfd::FileDialog::new().set_title("Update archives").add_filter("Archives", &["rar", "7z", "zip"]).pick_files()
+            } else {
+                None
+            };
+            if let Some(paths) = picked {
+                self.pending = paths.iter().map(|d| update::parse(d)).collect::<Result<Vec<_>, _>>().and_then(|ups| update::ladder(&g.version, ups)).map_err(|e| format!("{e:#}"));
+                if matches!(&self.pending, Ok(u) if u.is_empty()) {
+                    // all skipped as not newer: say so instead of showing nothing
+                    self.pending = Err(format!("None of them is newer than v{}. If the game's version is wrong, correct it above.", g.version));
+                }
+            }
+            let has_plan = matches!(&self.pending, Ok(u) if !u.is_empty()) || self.pending.is_err();
+            if let Ok(ups) = &self.pending
+                && !ups.is_empty()
+            {
+                let why = if !installed { "install the game first" } else if self.no_umu { "umu-launcher is missing" } else { "this game's job is running" };
+                let label = format!("{} {} update(s)", if self.busy { "Queue" } else { "Apply" }, ups.len());
+                if ui.add_enabled(!self.busy_with(&g) && !self.queued(&g) && !self.no_umu && installed, egui::Button::new(label)).on_hover_text("A setup window will open: click Next / Install / Finish in it.").on_disabled_hover_text(why).clicked() {
+                    let ups = std::mem::replace(&mut self.pending, Ok(vec![])).unwrap_or_default();
+                    self.spawn(&ctx, g.clone(), Job::Updates { ups, verify: self.settings.verify, backup: self.settings.backup_updates });
+                }
+            }
+            if has_plan && ui.button("Clear").clicked() {
+                self.pending = Ok(vec![]);
+            }
+            if ui.add_enabled(idle && installed, egui::Button::new("Check for updates"))
+                .on_hover_text("looks inside the repack folder, next to it, and in Downloads for this game's update folders and archives")
+                .clicked()
+            {
+                self.pending = update::find_for(&g);
+                if matches!(&self.pending, Ok(u) if u.is_empty()) {
+                    self.notify(Some(g.dir.clone()), "No newer update found next to the game or in Downloads.", false);
+                }
+            }
+        });
+        match &self.pending {
+            Ok(ups) => {
+                let mut v = if g.version.is_empty() { "?".to_string() } else { format!("v{}", g.version) };
+                for u in ups {
+                    ui.label(format!("{v} -> v{}   {}", u.to, u.dir.file_name().unwrap_or_default().to_string_lossy()));
+                    v = format!("v{}", u.to);
+                }
+            }
+            Err(e) => _ = ui.colored_label(err, e),
+        }
+
+        if windows {
+            section(ui, "Saves");
+            ui.horizontal(|ui| {
+                if ui.add_enabled(idle && has_prefix, egui::Button::new("Back up saves")).on_hover_text("copies the game's AppData/Documents saves to ~/Games/repackd-saves; Delete does this too").clicked() {
+                    self.spawn(&ctx, g.clone(), Job::BackupSaves);
+                }
+                let list = self.side(&g).saves.clone();
+                if list.is_empty() {
+                    ui.label(RichText::new("No backups yet.").color(sub));
+                } else {
+                    egui::ComboBox::from_id_salt("restore").selected_text("Restore a backup…").show_ui(ui, |ui| {
+                        for b in list {
+                            let label = b.file_name().unwrap_or_default().to_string_lossy().trim_end_matches(".tar.gz").replace("-auto", " (after playing)").replace('_', " ");
+                            if ui.selectable_label(false, label).clicked() {
+                                self.confirm_restore = Some(b);
+                            }
+                        }
+                    });
+                }
+            });
+            if let Some(b) = self.confirm_restore.clone() {
+                let when = b.file_name().unwrap_or_default().to_string_lossy().trim_end_matches(".tar.gz").replace("-auto", " (after playing)").replace('_', " ");
+                ui.label(format!("Replace the current saves with the backup from {when}?"));
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(idle, egui::Button::new(RichText::new("Yes, restore").color(err))).clicked() {
+                        self.spawn(&ctx, g.clone(), Job::RestoreSaves(b));
+                        self.confirm_restore = None;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.confirm_restore = None;
+                    }
+                });
+            }
         }
 
         section(ui, "Artwork");
@@ -1218,86 +1340,124 @@ impl App {
             }
         });
 
-        section(ui, "Updates");
-        if g.applied.is_empty() {
-            ui.label(RichText::new("No updates applied.").color(sub));
-        }
-        for a in &g.applied {
-            ui.label(format!("Applied {a}"));
-        }
-        if let Some((from, to)) = self.side(&g).undo.clone().filter(|(f, t)| [f, t].iter().any(|v| update::vcmp(v, &g.version) == std::cmp::Ordering::Equal)) {
+        section(ui, "Files");
+        if let Some(to) = self.confirm_move.clone() {
+            let outside = g.game_dir.as_ref().filter(|d| !d.starts_with(&g.dir));
+            let dest = to.join(g.dir.file_name().unwrap_or_default());
+            let kept = outside.map(|d| format!(" The game folder {} stays where it is: only repackd's folder (prefix, launch script, artwork) moves.", d.display())).unwrap_or_default();
+            ui.label(format!("Move {} to {}?{kept} Don't close repackd until it is done.", g.dir.display(), dest.display()));
             ui.horizontal(|ui| {
-                if ui.add_enabled(idle, egui::Button::new(format!("Undo update to v{to}"))).on_hover_text(format!("puts the game files back as they were at v{from}")).clicked() {
-                    self.spawn(&ctx, g.clone(), Job::UndoUpdate);
+                if ui.button(RichText::new("Yes, move it").color(err)).clicked() {
+                    self.confirm_move = None;
+                    self.spawn(&ctx, g.clone(), Job::Move { to });
                 }
-                if ui.add_enabled(idle, egui::Button::new("Delete update backups")).on_hover_text("frees their space; updates can't be undone after this").clicked() {
-                    (self.side, self.disk) = (None, None);
-                    match update::delete_backups(&g) {
-                        Ok(()) => self.notify(Some(g.dir.clone()), "Update backups deleted.", false),
-                        Err(e) => self.say(format!("error: {e:#}")),
-                    }
+                if ui.button("Keep it here").clicked() {
+                    self.confirm_move = None;
                 }
             });
         }
         ui.horizontal(|ui| {
-            let folders = ui.add_enabled(idle, egui::Button::new("Add update folders…")).on_hover_text("pick one or more FitGirl update folders; they are applied oldest first").clicked();
-            let archives = ui.add_enabled(idle, egui::Button::new("Add update archives…")).on_hover_text("scene updates as .rar/.7z/.zip (for a multi-part RAR pick its .part1.rar); unpacked, installed, then their crack copied in").clicked();
-            let picked = if folders {
-                rfd::FileDialog::new().set_title("Update folders").pick_folders()
-            } else if archives {
-                rfd::FileDialog::new().set_title("Update archives").add_filter("Archives", &["rar", "7z", "zip"]).pick_files()
-            } else {
-                None
-            };
-            if let Some(paths) = picked {
-                self.pending = paths.iter().map(|d| update::parse(d)).collect::<Result<Vec<_>, _>>().and_then(|ups| update::ladder(&g.version, ups)).map_err(|e| format!("{e:#}"));
-                if matches!(&self.pending, Ok(u) if u.is_empty()) {
-                    // all skipped as not newer: say so instead of showing nothing
-                    self.pending = Err(format!("None of them is newer than v{}. If the game's version is wrong, correct it above.", g.version));
+            // the desktop's own file manager: copy mods into the game folder there
+            let mut dirs = vec![("Browse game files", g.install_dir())];
+            if windows {
+                dirs.push(("Open game data folder", g.prefix()));
+            }
+            for (label, dir) in dirs {
+                if ui.add_enabled(dir.is_dir(), egui::Button::new(label)).clicked() {
+                    // D-Bus may have to start the file manager first: not on the UI thread
+                    let tx = self.tx.clone();
+                    std::thread::spawn(move || {
+                        if let Err(e) = crate::open_folder(&dir) {
+                            let _ = tx.send(Ev::Log(format!("error: open folder: {e:#}")));
+                        }
+                    });
                 }
             }
-            let has_plan = matches!(&self.pending, Ok(u) if !u.is_empty()) || self.pending.is_err();
-            if let Ok(ups) = &self.pending
-                && !ups.is_empty()
+            if ui.add_enabled(self.confirm_move.is_none() && !self.busy_with(&g) && !self.queued(&g), egui::Button::new("Move to another folder…")).on_hover_text("moves repackd's folder for this game (prefix, launch script, artwork, shader cache) to another disk or folder").clicked()
+                && let Some(to) = rfd::FileDialog::new().set_title("Move into folder").pick_folder()
             {
-                let why = if !installed { "install the game first" } else if self.no_umu { "umu-launcher is missing" } else { "this game's job is running" };
-                let label = format!("{} {} update(s)", if self.busy { "Queue" } else { "Apply" }, ups.len());
-                if ui.add_enabled(!self.busy_with(&g) && !self.queued(&g) && !self.no_umu && installed, egui::Button::new(label)).on_disabled_hover_text(why).clicked() {
-                    let ups = std::mem::replace(&mut self.pending, Ok(vec![])).unwrap_or_default();
-                    self.spawn(&ctx, g.clone(), Job::Updates { ups, verify: self.settings.verify, backup: self.settings.backup_updates });
-                }
-            }
-            if has_plan && ui.button("Clear").clicked() {
-                self.pending = Ok(vec![]);
-            }
-            if ui.add_enabled(idle && installed, egui::Button::new("Check for updates"))
-                .on_hover_text("looks inside the repack folder, next to it, and in Downloads for this game's update folders and archives")
-                .clicked()
-            {
-                self.pending = update::find_for(&g);
-                if matches!(&self.pending, Ok(u) if u.is_empty()) {
-                    self.notify(Some(g.dir.clone()), "No newer update found next to the game or in Downloads.", false);
+                match crate::move_refusal(&g, &to) {
+                    Ok(()) => self.confirm_move = Some(to),
+                    Err(e) => self.say(format!("error: cannot move {}: {e:#}", g.name)),
                 }
             }
         });
-        match &self.pending {
-            Ok(ups) => {
-                let mut v = if g.version.is_empty() { "?".to_string() } else { format!("v{}", g.version) };
-                for u in ups {
-                    ui.label(format!("{v} -> v{}   {}", u.to, u.dir.file_name().unwrap_or_default().to_string_lossy()));
-                    v = format!("v{}", u.to);
+        if installed {
+            ui.horizontal(|ui| {
+                match &self.disk {
+                    Some((d, [game, pfx, repack, backups])) if *d == g.dir => {
+                        let mut parts = vec![format!("Game {}", gb(*game)), format!("{} {}", if imported { "game data folder" } else { "game data folder (Wine prefix)" }, gb(*pfx))];
+                        if *repack > 0 {
+                            parts.push(format!("repack {}", gb(*repack)));
+                        }
+                        if *backups > 0 {
+                            parts.push(format!("update backups {}", gb(*backups)));
+                        }
+                        ui.label(RichText::new(parts.join(" · ")).color(sub));
+                    }
+                    _ => {
+                        if ui.button("Show disk use").clicked() {
+                            let (g, tx) = (g.clone(), self.tx.clone());
+                            std::thread::spawn(move || {
+                                let [game, pfx, repack] = crate::disk_sizes(&g);
+                                let _ = tx.send(Ev::DiskUse(g.dir.clone(), [game, pfx, repack, update::backups_size(&g)]));
+                            });
+                        }
+                    }
                 }
-            }
-            Err(e) => _ = ui.colored_label(err, e),
+            });
         }
+
+        ui.add_space(22.0);
+        egui::CollapsingHeader::new(RichText::new("Advanced tools").heading()).default_open(false).show(ui, |ui| {
+            if windows {
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(idle && has_prefix && !self.no_umu, egui::Button::new("Run .exe in the game data folder…")).on_hover_text("mod installers, trainers, patchers: run with this game's Proton").on_disabled_hover_text("set up or install the game first").clicked()
+                        && let Some(exe) = rfd::FileDialog::new().add_filter("Windows programs", &["exe"]).set_directory(g.install_dir()).pick_file()
+                    {
+                        self.spawn(&ctx, g.clone(), Job::RunExe(exe));
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.verbs).hint_text("Windows components to install, e.g. vcrun2022").desired_width(380.0));
+                    let verbs: Vec<String> = self.verbs.split_whitespace().map(String::from).collect();
+                    let why = if self.no_winetricks { format!("winetricks is not installed: {}", crate::install_hint("winetricks")) } else { "type the verbs first".into() };
+                    if ui.add_enabled(idle && !verbs.is_empty() && !self.no_umu && !self.no_winetricks, egui::Button::new("Run winetricks")).on_disabled_hover_text(why).clicked() {
+                        self.spawn(&ctx, g.clone(), Job::Winetricks(verbs));
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let size = self.side(&g).shader_cache;
+                    ui.label(format!("Shader cache: {:.0} MB", size as f64 / 1e6));
+                    // Play sets no busy flag, so the running check (a /proc scan) is made on click, not every frame
+                    if ui.add_enabled(size > 0 && idle, egui::Button::new("Clear shader cache")).on_hover_text("games rebuild it as they play").clicked() {
+                        if !crate::game_pids(&g).is_empty() {
+                            self.say(format!("{} is running: close it before clearing its shader cache", g.name));
+                        } else {
+                            match std::fs::remove_dir_all(g.dir.join("shadercache")) {
+                                Ok(()) => self.say(format!("cleared the shader cache of {}", g.name)),
+                                Err(e) => self.say(format!("error: clear shader cache: {e}")),
+                            }
+                            self.side = None;
+                        }
+                    }
+                });
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Copy diagnostics").on_hover_text("versions, hardware, this game's settings and its last run, as text for a bug report").clicked() {
+                    ctx.copy_text(crate::diagnostics(&g, &self.settings));
+                    self.say(format!("copied diagnostics for {} to the clipboard", g.name));
+                }
+            });
+        });
 
         section(ui, "Install");
         if imported {
-            ui.label(RichText::new("Already unpacked: repackd never deletes these files (updates and mod tools you run do change them).").color(sub));
+            ui.label(RichText::new("These are your own files. repackd will not delete them.").color(sub));
             ui.horizontal(|ui| {
                 if windows || has_prefix {
                     let label = if has_prefix { "Set up prefix again" } else { "Set up prefix" };
-                    if ui.add_enabled(idle && !self.no_umu, egui::Button::new(label)).on_hover_text("creates the Wine prefix with the VC++ runtimes the game ships").clicked() {
+                    if ui.add_enabled(idle && !self.no_umu, egui::Button::new(label)).on_hover_text("creates the game data folder (Wine prefix) with the Windows components the game ships").clicked() {
                         self.spawn(&ctx, g.clone(), Job::Import);
                     }
                 }
@@ -1331,31 +1491,6 @@ impl App {
             });
         }
 
-        if installed {
-            ui.horizontal(|ui| {
-                match &self.disk {
-                    Some((d, [game, pfx, repack, backups])) if *d == g.dir => {
-                        let mut parts = vec![format!("Game {}", gb(*game)), format!("Wine prefix {}", gb(*pfx))];
-                        if *repack > 0 {
-                            parts.push(format!("repack {}", gb(*repack)));
-                        }
-                        if *backups > 0 {
-                            parts.push(format!("update backups {}", gb(*backups)));
-                        }
-                        ui.label(RichText::new(parts.join(" · ")).color(sub));
-                    }
-                    _ => {
-                        if ui.button("Show disk use").clicked() {
-                            let (g, tx) = (g.clone(), self.tx.clone());
-                            std::thread::spawn(move || {
-                                let [game, pfx, repack] = crate::disk_sizes(&g);
-                                let _ = tx.send(Ev::DiskUse(g.dir.clone(), [game, pfx, repack, update::backups_size(&g)]));
-                            });
-                        }
-                    }
-                }
-            });
-        }
         if installed && g.has_repack() {
             if !g.repack_dir.is_dir() {
                 ui.label(RichText::new("The repack folder was deleted: reinstalling or checking its files needs it again.").color(sub));
@@ -1377,126 +1512,15 @@ impl App {
             }
         }
 
-        section(ui, "Mods & files");
-        if let Some(to) = self.confirm_move.clone() {
-            let outside = g.game_dir.as_ref().filter(|d| !d.starts_with(&g.dir));
-            let dest = to.join(g.dir.file_name().unwrap_or_default());
-            let kept = outside.map(|d| format!(" The game folder {} stays where it is: only repackd's folder (prefix, launch script, artwork) moves.", d.display())).unwrap_or_default();
-            ui.label(format!("Move {} to {}?{kept} Don't close repackd until it is done.", g.dir.display(), dest.display()));
-            ui.horizontal(|ui| {
-                if ui.button(RichText::new("Yes, move it").color(err)).clicked() {
-                    self.confirm_move = None;
-                    self.spawn(&ctx, g.clone(), Job::Move { to });
-                }
-                if ui.button("Keep it here").clicked() {
-                    self.confirm_move = None;
-                }
-            });
-        }
-        ui.horizontal(|ui| {
-            if ui.add_enabled(self.confirm_move.is_none() && !self.busy_with(&g) && !self.queued(&g), egui::Button::new("Move to another folder…")).on_hover_text("moves repackd's folder for this game (prefix, launch script, artwork, shader cache) to another disk or folder").clicked()
-                && let Some(to) = rfd::FileDialog::new().set_title("Move into folder").pick_folder()
-            {
-                match crate::move_refusal(&g, &to) {
-                    Ok(()) => self.confirm_move = Some(to),
-                    Err(e) => self.say(format!("error: cannot move {}: {e:#}", g.name)),
-                }
-            }
-            if ui.button("Copy diagnostics").on_hover_text("versions, hardware, this game's settings and its last run, as text for a bug report").clicked() {
-                ctx.copy_text(crate::diagnostics(&g, &self.settings));
-                self.say(format!("copied diagnostics for {} to the clipboard", g.name));
-            }
-        });
-        if windows {
-            ui.horizontal(|ui| {
-                let size = self.side(&g).shader_cache;
-                ui.label(format!("Shader cache: {:.0} MB", size as f64 / 1e6));
-                // Play sets no busy flag, so the running check (a /proc scan) is made on click, not every frame
-                if ui.add_enabled(size > 0 && idle, egui::Button::new("Clear shader cache")).on_hover_text("games rebuild it as they play").clicked() {
-                    if !crate::game_pids(&g).is_empty() {
-                        self.say(format!("{} is running: close it before clearing its shader cache", g.name));
-                    } else {
-                        match std::fs::remove_dir_all(g.dir.join("shadercache")) {
-                            Ok(()) => self.say(format!("cleared the shader cache of {}", g.name)),
-                            Err(e) => self.say(format!("error: clear shader cache: {e}")),
-                        }
-                        self.side = None;
-                    }
-                }
-            });
-        }
-        ui.horizontal(|ui| {
-            // the desktop's own file manager: copy mods into the game folder there
-            let mut dirs = vec![("Browse game files", g.install_dir())];
-            if windows {
-                dirs.push(("Open prefix folder", g.prefix()));
-            }
-            for (label, dir) in dirs {
-                if ui.add_enabled(dir.is_dir(), egui::Button::new(label)).clicked() {
-                    // D-Bus may have to start the file manager first: not on the UI thread
-                    let tx = self.tx.clone();
-                    std::thread::spawn(move || {
-                        if let Err(e) = crate::open_folder(&dir) {
-                            let _ = tx.send(Ev::Log(format!("error: open folder: {e:#}")));
-                        }
-                    });
-                }
-            }
-            if windows
-                && ui.add_enabled(idle && has_prefix && !self.no_umu, egui::Button::new("Run .exe in this prefix…")).on_hover_text("mod installers, trainers, patchers: run with this game's Proton").on_disabled_hover_text("set up or install the game first").clicked()
-                && let Some(exe) = rfd::FileDialog::new().add_filter("Windows programs", &["exe"]).set_directory(g.install_dir()).pick_file()
-            {
-                self.spawn(&ctx, g.clone(), Job::RunExe(exe));
-            }
-        });
-        if windows {
-            ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.verbs).hint_text("winetricks verbs, e.g. vcrun2022 d3dx9").desired_width(380.0));
-                let verbs: Vec<String> = self.verbs.split_whitespace().map(String::from).collect();
-                let why = if self.no_winetricks { format!("winetricks is not installed: {}", crate::install_hint("winetricks")) } else { "type the verbs first".into() };
-                if ui.add_enabled(idle && !verbs.is_empty() && !self.no_umu && !self.no_winetricks, egui::Button::new("Run winetricks")).on_disabled_hover_text(why).clicked() {
-                    self.spawn(&ctx, g.clone(), Job::Winetricks(verbs));
-                }
-            });
-
-            section(ui, "Saves");
-            ui.horizontal(|ui| {
-                if ui.add_enabled(idle && has_prefix, egui::Button::new("Back up saves")).on_hover_text("copies the game's AppData/Documents saves to ~/Games/repackd-saves; Delete does this too").clicked() {
-                    self.spawn(&ctx, g.clone(), Job::BackupSaves);
-                }
-                let list = self.side(&g).saves.clone();
-                if list.is_empty() {
-                    ui.label(RichText::new("No backups yet.").color(sub));
-                } else {
-                    egui::ComboBox::from_id_salt("restore").selected_text("Restore a backup…").show_ui(ui, |ui| {
-                        for b in list {
-                            let label = b.file_name().unwrap_or_default().to_string_lossy().trim_end_matches(".tar.gz").replace("-auto", " (after playing)").replace('_', " ");
-                            if ui.selectable_label(false, label).clicked() {
-                                self.confirm_restore = Some(b);
-                            }
-                        }
-                    });
-                }
-            });
-            if let Some(b) = self.confirm_restore.clone() {
-                let when = b.file_name().unwrap_or_default().to_string_lossy().trim_end_matches(".tar.gz").replace("-auto", " (after playing)").replace('_', " ");
-                ui.label(format!("Replace the current saves with the backup from {when}?"));
-                ui.horizontal(|ui| {
-                    if ui.add_enabled(idle, egui::Button::new(RichText::new("Yes, restore").color(err))).clicked() {
-                        self.spawn(&ctx, g.clone(), Job::RestoreSaves(b));
-                        self.confirm_restore = None;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        self.confirm_restore = None;
-                    }
-                });
-            }
-        }
-
         section(ui, "Delete");
         self.delete_confirm(ui, i);
 
-        section(ui, "Log");
+        ui.add_space(22.0);
+        let log_head = ui.label(RichText::new("Log").heading());
+        ui.separator();
+        if std::mem::take(&mut self.scroll_to_log) {
+            log_head.scroll_to_me(Some(egui::Align::Min));
+        }
         egui::Frame::new().fill(ui.visuals().extreme_bg_color).corner_radius(6).inner_margin(10).show(ui, |ui| {
             ui.set_height(260.0);
             ui.set_width(ui.available_width());
@@ -1519,7 +1543,12 @@ impl App {
         ui.vertical(|ui| {
             let what = match (&g.game_dir, g.status) {
                 (Some(_), _) => "Remove it from repackd? The game's own files are kept; saves are backed up first.".to_string(),
-                (None, Status::Installed) => "Delete the installed game? Saves are backed up first; the repack folder is kept.".to_string(),
+                (None, Status::Installed) => {
+                    // only a size already measured: never computed here, on the UI thread
+                    let known = self.disk_rows.get(&g.dir).map(|s| s[0] + s[1]).or_else(|| self.disk.as_ref().filter(|(d, _)| *d == g.dir).map(|(_, s)| s[0] + s[1]));
+                    let size = known.map(|b| format!(" and free {}", gb(b))).unwrap_or_default();
+                    format!("Delete the installed game{size}? Your saves are copied to a backup first. The repack folder stays. This can't be stopped once started.")
+                }
                 (None, _) => "Remove it from the library? The repack folder is kept.".to_string(),
             };
             ui.label(what);
@@ -1613,7 +1642,7 @@ impl App {
                     let log = std::fs::read_to_string(&out).unwrap_or_default();
                     match crate::diagnose(&log, other.as_deref()) {
                         Some((text, fix)) => _ = tx.send(Ev::StartFailed(dir.clone(), text, fix)),
-                        None if !st.success() => _ = tx.send(Ev::StartFailed(dir.clone(), format!("The game stopped right away ({st}). Its output is under Launch, \"Last run\", in its settings."), None)),
+                        None if !st.success() => _ = tx.send(Ev::StartFailed(dir.clone(), "The game closed right away. Open Game settings, then \"Why won't it start?\"".to_string(), None)),
                         None => {}
                     }
                 }
@@ -1796,7 +1825,7 @@ impl App {
             ui.add(egui::Label::new(RichText::new(last.as_str()).monospace().weak().small()).truncate());
         }
         if matches!(self.job_label, "Installing" | "Updating") && self.job_step.starts_with("Unpacking") {
-            ui.label(RichText::new("If an \"ISDone.dll\" error window appears, the unpack failed: press Cancel.").weak().small());
+            ui.label(RichText::new("If a window with an error appears, press Cancel, then INSTALL AGAIN.").weak().small());
         }
     }
 

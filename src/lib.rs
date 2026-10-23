@@ -3,7 +3,7 @@ pub mod steam;
 pub mod ui;
 pub mod update;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -65,7 +65,7 @@ impl Kind {
 
     pub fn label(self) -> &'static str {
         match self {
-            Kind::Windows => "Windows (Proton)",
+            Kind::Windows => "Windows game",
             Kind::Switch => "Nintendo Switch (emulator)",
             Kind::Ps4 => "PS4 (shadPS4)",
         }
@@ -610,11 +610,12 @@ impl Library {
         if let Some(g) = self.games.iter().find(|g| g.repack_dir == repack_dir) {
             bail!("this repack is already in the library as \"{}\"", g.name);
         }
-        let name = repack_dir.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let folder = repack_dir.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let name = clean_name(&folder);
         let dir = self.new_dir(&name);
         let setup = find_setup(&repack_dir).ok().and_then(|p| read_capped(&p, SETUP_CAP).ok());
         let size = setup.as_deref().and_then(setup_size);
-        let version = update::versions(&name).pop().or_else(|| setup.as_deref().and_then(setup_version)).unwrap_or_default();
+        let version = update::versions(&folder).pop().or_else(|| setup.as_deref().and_then(setup_version)).unwrap_or_default();
         self.games.push(Game { name, repack_dir, dir, version, proton: default_proton(), size, header_read: true, ..Default::default() });
         Ok(self.games.len() - 1)
     }
@@ -629,9 +630,10 @@ impl Library {
         }
         let files = files_under(&game_dir); // one walk for the kind and the game file (an NTFS disk is slow to walk)
         let kind = [Kind::Switch, Kind::Ps4, Kind::Windows].into_iter().find(|&k| files.iter().any(|f| k.is_target(f))).context("no game in this folder: no .exe, .nsp/.xci or eboot.bin")?;
-        let name = game_dir.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let folder = game_dir.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let name = clean_name(&folder);
         let dir = self.new_dir(&name);
-        let version = update::versions(&name).pop().or_else(|| version_file(&game_dir)).unwrap_or_default();
+        let version = update::versions(&folder).pop().or_else(|| version_file(&game_dir)).unwrap_or_default();
         let exe = rank(&files, kind).into_iter().next(); // the picker's best guess, so Play and Steam have a file
         self.games.push(Game { name, dir, status: Status::Installed, kind, version, proton: default_proton(), exe, game_dir: Some(game_dir), ..Default::default() });
         Ok(self.games.len() - 1)
@@ -645,6 +647,37 @@ impl Library {
     }
 
 
+}
+
+/// A folder name as a game name: drops "[FitGirl Repack]" tags, a trailing "+ 5 DLCs + Bonus" part and a trailing
+/// version (that one is read from the folder name separately, so it is kept as the game's version). Never empty.
+fn clean_name(folder: &str) -> String {
+    let mut s = folder.to_string();
+    // bracketed tags that say "repack"; an unclosed bracket is left alone
+    while let Some((a, b)) = s.char_indices().find_map(|(i, c)| {
+        let close = match c { '[' => ']', '(' => ')', _ => return None };
+        let end = i + s[i..].find(close)?;
+        s[i..=end].to_lowercase().contains("repack").then_some((i, end + 1))
+    }) {
+        s.replace_range(a..b, "");
+    }
+    // " + " starts an extras list when it begins with a number or names extras ("Dungeons + Dragons" stays)
+    let extra = |r: &str| {
+        let l = r.to_lowercase();
+        r.starts_with(|c: char| c.is_ascii_digit()) || ["dlc", "bonus", "ost", "soundtrack"].iter().any(|k| l.contains(k))
+    };
+    if let Some(i) = s.match_indices(" + ").map(|(i, _)| i).find(|&i| extra(&s[i + 3..])) {
+        s.truncate(i);
+    }
+    let trim = |s: &str| s.trim_matches(|c: char| c.is_whitespace() || c == '-' || c == '–' || c == ',').to_string();
+    let mut s = trim(&s);
+    if let Some((head, last)) = s.rsplit_once(char::is_whitespace)
+        && last.starts_with(['v', 'V'])
+        && !update::versions(last).is_empty()
+    {
+        s = trim(head);
+    }
+    if s.is_empty() { folder.to_string() } else { s }
 }
 
 /// Empty file in every game dir: `delete_files` accepts games outside the games root that have it.
@@ -767,7 +800,7 @@ pub fn find_setup(repack: &Path) -> Result<PathBuf> {
 /// compatibility tools folders (GE-Proton, proton-cachyos, ...) and Valve's own Proton in every Steam library.
 /// (label, value for `Game::proton`).
 pub fn protons() -> Vec<(String, String)> {
-    let mut out = vec![("GE-Proton (latest, downloaded automatically)".to_string(), default_proton())];
+    let mut out = vec![("Automatic (recommended)".to_string(), default_proton())];
     let h = home();
     let steam = h.join(".local/share/Steam");
     let mut roots = vec![steam.join("compatibilitytools.d"), h.join(".steam/root/compatibilitytools.d"), PathBuf::from("/usr/share/steam/compatibilitytools.d")];
@@ -1451,7 +1484,7 @@ pub fn check(md5: &Path, log: &impl Report) -> Result<()> {
     let bad = verify(md5, log)?;
     bad.iter().for_each(|b| log.log(b.clone()));
     if !bad.is_empty() {
-        bail!("{} file(s) failed verification", bad.len());
+        bail!("{} file(s) are damaged", bad.len());
     }
     log.log("all files verified".into());
     Ok(())
@@ -1678,7 +1711,7 @@ fn stall_watch(dir: &Path, total: Option<u64>, done: &AtomicBool, every: Duratio
             (size, since, warned) = (now, Instant::now(), false);
         } else if !warned && since.elapsed() >= stall {
             log.log(format!(
-                "no progress for {} min: if an \"ISDone.dll\" / Unarc error window is open, this repack failed to unpack under Wine; press Cancel",
+                "no progress for {} min. If a window with an error appears, press Cancel, then INSTALL AGAIN.",
                 stall.as_secs() / 60
             ));
             warned = true;
@@ -1746,11 +1779,16 @@ pub fn install_checks(g: &Game, verify_first: bool, log: &impl Report) -> Result
     if !game_pids(g).is_empty() {
         bail!("{} is running: close it first (installing over a running game breaks both)", g.name);
     }
+    if g.proton_path() == "GE-Proton" && !protons().iter().any(|(l, v)| v.contains('/') && l.starts_with("GE-Proton")) {
+        log.log("The first start downloads Proton (about 500 MB).".into());
+    }
     if verify_first {
         match find_md5(&g.repack_dir) {
             Some(f) => {
                 log.step("Checking repack files");
-                check(&f, log).context("re-download the bad files before installing")?
+                log.log("Checking the files first (this can take a while on big games).".into());
+                // neutral message: updates and verify reuse `check`, so the advice is added per call site
+                check(&f, log).map_err(|e| anyhow!("{e}, so nothing was installed. Download the repack again, then press INSTALL."))?
             }
             None => log.log("no checksum file, skipped verification".into()),
         }
@@ -1781,7 +1819,7 @@ pub fn install(g: &Game, setup: &Path, verify_first: bool, unattended: bool, log
     let after = g.install_dir().join("_Redist/fitgirl.md5");
     if verify_first && after.is_file() {
         log.step("Checking installed files");
-        check(&after, log).context("installed files are damaged: reinstall")?;
+        check(&after, log).map_err(|e| anyhow!("{e} after installing. Reinstall the game."))?;
     }
     Ok(())
 }
@@ -2021,22 +2059,21 @@ pub fn diagnose(out: &str, other_proton: Option<&str>) -> Option<(String, Option
         .find(|(p, _)| dll.starts_with(p))
         .map(|(_, v)| *v);
         return Some(match verb {
-            Some(v) => (format!("The game needs {dll}, which this prefix does not have: install {v} with winetricks."), Some(Fix::Winetricks(v))),
-            None => (format!("The game needs {dll}, which this prefix does not have."), None),
+            Some(v) => (format!("The game is missing a Windows component ({dll})."), Some(Fix::Winetricks(v))),
+            None => (format!("The game is missing a Windows component ({dll})."), None),
         });
     }
     let has = |p: &str| out.lines().any(|l| l.to_ascii_lowercase().contains(p));
     if has("easyanticheat") || has("battleye") {
-        return Some(("The game uses anti-cheat (EasyAntiCheat/BattlEye), which often refuses to run on Linux or with a crack.".into(), None));
+        return Some(("This game uses anti-cheat that usually does not work on Linux.".into(), None));
     }
     if has("vk_error") || has("vkcreateinstance failed") || has("no vulkan") {
-        return Some(("Vulkan could not start: check the GPU driver's Vulkan package (vulkan-radeon, vulkan-intel or nvidia-utils).".into(), None));
+        return Some(("Your graphics driver is missing Vulkan support. Install the Vulkan driver package for your GPU from your distribution.".into(), None));
     }
     if has("unhandled exception") || has("unhandled page fault") || has("backtrace:") {
-        let text = "The game crashed under this Proton version.";
         return Some(match other_proton {
-            Some(p) => (format!("{text} Try {p}."), Some(Fix::Proton(p.to_string()))),
-            None => (format!("{text} Download another one in Settings, Proton versions."), None),
+            Some(p) => ("The game crashed. Try a different compatibility version (Proton):".into(), Some(Fix::Proton(p.to_string()))),
+            None => ("The game crashed. Download a different compatibility version (Proton) in Settings.".into(), None),
         });
     }
     None
@@ -2616,13 +2653,22 @@ mod tests {
     }
 
     #[test]
+    fn clean_names() {
+        assert_eq!(clean_name("Dave the Diver [FitGirl Repack]"), "Dave the Diver");
+        assert_eq!(clean_name("Game X - v1.2.3 + 5 DLCs + Bonus Content [FitGirl Repack]"), "Game X");
+        assert_eq!(clean_name("Game Y, v2.0 (DODI Repack)"), "Game Y");
+        assert_eq!(clean_name("Dungeons + Dragons"), "Dungeons + Dragons");
+        assert_eq!(clean_name("[FitGirl Repack]"), "[FitGirl Repack]");
+    }
+
+    #[test]
     fn check_fails_only_on_bad_files() {
         let d = tmp("check");
         std::fs::write(d.join("a.bin"), b"").unwrap();
         std::fs::write(d.join("ok.md5"), "d41d8cd98f00b204e9800998ecf8427e *a.bin\n").unwrap();
         std::fs::write(d.join("bad.md5"), "00000000000000000000000000000000 *a.bin\n").unwrap();
         assert!(check(&d.join("ok.md5"), &|_| {}).is_ok());
-        assert!(check(&d.join("bad.md5"), &|_| {}).unwrap_err().to_string().contains("1 file(s) failed"));
+        assert!(check(&d.join("bad.md5"), &|_| {}).unwrap_err().to_string().contains("1 file(s) are damaged"));
         std::fs::remove_dir_all(&d).unwrap();
     }
 
@@ -2892,7 +2938,7 @@ mod tests {
         std::fs::create_dir_all(&twin).unwrap();
         std::fs::write(twin.join("setup.exe"), b"").unwrap();
         lib.add(twin).unwrap();
-        assert_eq!(lib.games[1].dir, d.join("games/some-game-fitgirl-repack-2"));
+        assert_eq!(lib.games[1].dir, d.join("games/some-game-2"));
         lib.save().unwrap();
         let back = Library::load(d.join("lib.json"), d.join("games")).unwrap();
         assert_eq!(back.games, lib.games);

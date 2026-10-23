@@ -145,7 +145,14 @@ pub(super) fn show(app: &mut App, ui: &mut Ui) {
     }
     egui::Panel::top("easy-top").frame(egui::Frame::new().fill(C::bar()).inner_margin(egui::Margin::symmetric(24, 12))).show(ui, |ui| {
         if app.no_umu {
-            ui.colored_label(C::err(), format!("umu-launcher is not installed, so nothing can be installed or played: {}", crate::install_hint("umu-run")));
+            let hint = crate::install_hint("umu-run");
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("repackd needs umu-launcher to run games. Install it, then restart repackd:").color(C::accent()).strong());
+                ui.label(RichText::new(&hint).color(C::text()));
+                if ui.small_button("Copy command").clicked() {
+                    ui.ctx().copy_text(hint);
+                }
+            });
         }
         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
             ui.set_min_height(36.0); // the title sits on the buttons' centre line
@@ -242,8 +249,9 @@ fn global_settings(app: &mut App, ui: &mut Ui) {
     note_line(app, ui, None);
     let section = |ui: &mut Ui, title: &str| {
         ui.add_space(22.0);
-        ui.label(RichText::new(title).heading());
+        let r = ui.label(RichText::new(title).heading());
         ui.separator();
+        r
     };
     egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
         section(ui, "Appearance");
@@ -260,65 +268,10 @@ fn global_settings(app: &mut App, ui: &mut Ui) {
             app.styled = false; // restyled next frame
         }
 
-        section(ui, "Requirements");
-        egui::Grid::new("reqs").num_columns(3).spacing([18.0, 8.0]).show(ui, |ui| {
-            // looked up every 5 s, not every frame: a tool installed while the app is open shows up
-            static FOUND: std::sync::Mutex<Option<(std::time::Instant, Vec<bool>)>> = std::sync::Mutex::new(None);
-            const TOOLS: [(&str, &str); 7] = [
-                ("umu-run", "needed: runs every game and installer"),
-                ("winetricks", "prefix tools and missing runtimes"),
-                ("7z", "update archives (.rar, .7z, .zip)"),
-                ("notify-send", "a notification when a long job ends"),
-                ("mangohud", "the MangoHud switch"),
-                ("gamemoderun", "the GameMode switch"),
-                ("gamescope", "the Gamescope switch"),
-            ];
-            let mut cache = FOUND.lock().unwrap_or_else(|e| e.into_inner());
-            if cache.as_ref().is_none_or(|(t, _)| t.elapsed().as_secs() >= 5) {
-                *cache = Some((std::time::Instant::now(), TOOLS.iter().map(|(b, _)| crate::which_path(b).is_some()).collect()));
-            }
-            let found = cache.as_ref().map(|(_, f)| f.clone()).unwrap_or_default();
-            for ((bin, what), found) in TOOLS.iter().zip(&found) {
-                ui.label(*bin);
-                if *found {
-                    ui.label(RichText::new("installed").color(C::play()));
-                } else {
-                    ui.label(RichText::new(format!("missing: {}", crate::install_hint(bin))).color(if *bin == "umu-run" { C::err() } else { C::accent() }));
-                }
-                ui.label(RichText::new(*what).color(C::sub()).small());
-                ui.end_row();
-            }
-        });
-
-        section(ui, "Artwork");
-        ui.label(RichText::new("Covers, banners and logos come from SteamGridDB. The key is free: steamgriddb.com, Preferences, API.").color(C::sub()));
-        ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut app.key_text).password(true).hint_text("paste the SteamGridDB API key").desired_width(380.0));
-            if ui.add_enabled(app.key_text.trim() != app.settings.sgdb_key, egui::Button::new("Save key")).clicked() {
-                let k = app.key_text.clone();
-                app.set_sgdb_key(k);
-                app.notify(None, if app.settings.sgdb_key.is_empty() { "Key removed." } else { "Key saved: fetching artwork for games that have none." }, false);
-            }
-            if !app.settings.sgdb_key.is_empty() {
-                ui.label(RichText::new("key set").color(C::sub()));
-            }
-        });
-
-        section(ui, "Installing");
-        let before = (app.settings.verify, app.settings.unattended);
-        ui.checkbox(&mut app.settings.verify, "Check the files before and after installing (FitGirl's checksums)");
-        ui.checkbox(&mut app.settings.unattended, "Install games without the installer's own windows (updates always show theirs)");
-        let before = (before, app.settings.backup_updates, app.settings.backup_saves_after_play);
-        ui.checkbox(&mut app.settings.backup_updates, "Back up the files an update changes, so it can be undone (instant on btrfs, a full copy elsewhere)");
-        ui.checkbox(&mut app.settings.backup_saves_after_play, "Back up saves after playing (the last 5 are kept)");
-        if before != ((app.settings.verify, app.settings.unattended), app.settings.backup_updates, app.settings.backup_saves_after_play) {
-            app.save_settings();
-        }
-
         section(ui, "Games folder");
         ui.label(RichText::new("New games go here. Existing games stay where they are; use Move in a game's settings to move one.").color(C::sub()));
+        ui.add(egui::Label::new(RichText::new(app.lib.root.display().to_string()).color(C::sub())).wrap());
         ui.horizontal(|ui| {
-            ui.label(app.lib.root.display().to_string());
             if ui.button("Choose…").clicked()
                 && let Some(d) = rfd::FileDialog::new().set_title("Folder new games are installed into").pick_folder()
             {
@@ -337,11 +290,16 @@ fn global_settings(app: &mut App, ui: &mut Ui) {
                 app.save_settings();
             }
         });
+        if ui.button("Disk usage").on_hover_text("what every game, its game data folder (Wine prefix) and its repack take").clicked() {
+            app.disk_page = true;
+            app.disk_rows.clear();
+            app.measure_disk(app.lib.games.clone());
+        }
 
         section(ui, "Watch folder");
-        ui.label(RichText::new("Download repacks here with your own client; a finished one is offered for adding.").color(C::sub()));
+        ui.label(RichText::new("Pick the folder where your downloads finish. New games there will appear in your library.").color(C::sub()));
+        ui.add(egui::Label::new(RichText::new(app.settings.watch_dir.as_ref().map_or("Not set".into(), |d| d.display().to_string())).color(C::sub())).wrap());
         ui.horizontal(|ui| {
-            ui.label(app.settings.watch_dir.as_ref().map_or("off".into(), |d| d.display().to_string()));
             if ui.button("Choose…").clicked()
                 && let Some(d) = rfd::FileDialog::new().set_title("Folder your torrent client downloads repacks into").pick_folder()
             {
@@ -349,7 +307,7 @@ fn global_settings(app: &mut App, ui: &mut Ui) {
                 app.save_settings();
                 app.sync_watch();
             }
-            if ui.add_enabled(app.settings.watch_dir.is_some(), egui::Button::new("Off")).clicked() {
+            if app.settings.watch_dir.is_some() && ui.button("Off").clicked() {
                 app.settings.watch_dir = None;
                 app.watching.clear();
                 app.save_settings();
@@ -357,7 +315,36 @@ fn global_settings(app: &mut App, ui: &mut Ui) {
             }
         });
 
-        section(ui, "Emulators");
+        section(ui, "Installing");
+        let before = (app.settings.verify, app.settings.unattended);
+        ui.checkbox(&mut app.settings.verify, "Check the files for damage when installing").on_hover_text("Check the files before and after installing (FitGirl's checksums)");
+        ui.checkbox(&mut app.settings.unattended, "Hide the installer's windows when installing").on_hover_text("Install games without the installer's own windows (updates always show theirs)");
+        let before = (before, app.settings.backup_updates, app.settings.backup_saves_after_play);
+        ui.checkbox(&mut app.settings.backup_updates, "Keep an undo copy when updating").on_hover_text("Back up the files an update changes, so it can be undone (instant on btrfs, a full copy elsewhere)");
+        ui.checkbox(&mut app.settings.backup_saves_after_play, "Back up saves after playing").on_hover_text("Back up saves after playing (the last 5 are kept)");
+        if before != ((app.settings.verify, app.settings.unattended), app.settings.backup_updates, app.settings.backup_saves_after_play) {
+            app.save_settings();
+        }
+
+        section(ui, "SteamGridDB key");
+        ui.label(RichText::new("Covers, banners and logos come from SteamGridDB.").color(C::sub()));
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut app.key_text).password(true).hint_text("paste the SteamGridDB API key").desired_width(380.0));
+            if ui.add_enabled(app.key_text.trim() != app.settings.sgdb_key, egui::Button::new("Save key")).clicked() {
+                let k = app.key_text.clone();
+                app.set_sgdb_key(k);
+                app.notify(None, if app.settings.sgdb_key.is_empty() { "Key removed." } else { "Key saved: fetching artwork for games that have none." }, false);
+            }
+            if !app.settings.sgdb_key.is_empty() {
+                ui.label(RichText::new("key set").color(C::sub()));
+            }
+        });
+        ui.label(RichText::new("Optional. Free account at steamgriddb.com, used only for cover art.").color(C::sub()).small());
+
+        let r = section(ui, "Emulators");
+        if std::mem::take(&mut app.scroll_to_emulators) {
+            r.scroll_to_me(Some(egui::Align::TOP));
+        }
         egui::Grid::new("emus").num_columns(2).spacing([18.0, 10.0]).min_col_width(170.0).show(ui, |ui| {
             for (k, label) in [(Kind::Switch, "Switch emulator"), (Kind::Ps4, "PS4 emulator")] {
                 super::row_label(ui, label);
@@ -381,118 +368,150 @@ fn global_settings(app: &mut App, ui: &mut Ui) {
         });
         ui.label(RichText::new("Set each emulator up (keys, firmware) in the emulator itself.").color(C::sub()).small());
 
-        section(ui, "Disk usage");
-        if ui.button("Disk usage").on_hover_text("what every game, its Wine prefix and its repack take").clicked() {
-            app.disk_page = true;
-            app.disk_rows.clear();
-            app.measure_disk(app.lib.games.clone());
-        }
-
-        section(ui, "Proton versions");
-        ui.label(RichText::new("Installed (each game picks one in its own settings):").color(C::sub()));
-        for (label, value) in app.protons.clone() {
-            let n = crate::proton_users(&app.lib.games, &app.protons, &value);
-            let used = match n {
-                0 => "unused".to_string(),
-                1 => "used by 1 game".into(),
-                n => format!("used by {n} games"),
-            };
-            let path = Path::new(&value);
-            // only the user's own folders: never /usr, never umu's automatic "GE-Proton" entry
-            let own = path.parent().is_some_and(|p| p.ends_with("compatibilitytools.d")) && !path.starts_with("/usr");
-            ui.horizontal(|ui| {
-                ui.label(if value == "GE-Proton" { label } else { format!("{label}    {value}") });
-                ui.label(RichText::new(used).color(C::sub()));
-                if !(own && n == 0) {
-                    return;
-                }
-                if app.confirm_proton.as_ref() != Some(&value) {
-                    if ui.add_enabled(!app.busy, egui::Button::new("Delete")).clicked() {
-                        app.confirm_proton = Some(value.clone());
-                    }
-                    return;
-                }
-                ui.label(RichText::new("Delete it? Steam games may still use it.").color(C::err()));
-                if ui.button(RichText::new("Yes, delete").color(C::err())).clicked() {
-                    app.confirm_proton = None;
-                    if app.busy {
-                        app.say("a job is running: wait for it before deleting a Proton".to_string());
-                    } else if let Some(g) = app.lib.games.iter().find(|g| !crate::game_pids(g).is_empty()) {
-                        app.say(format!("{} is running: close it before deleting a Proton", g.name));
+        section(ui, "Requirements");
+        const TOOLS: [(&str, &str); 7] = [
+            ("umu-run", "needed: runs every game and installer"),
+            ("winetricks", "prefix tools and missing runtimes"),
+            ("7z", "update archives (.rar, .7z, .zip)"),
+            ("notify-send", "a notification when a long job ends"),
+            ("mangohud", "the MangoHud switch"),
+            ("gamemoderun", "the GameMode switch"),
+            ("gamescope", "the Gamescope switch"),
+        ];
+        // looked up every 5 s, not every frame: a tool installed while the app is open shows up
+        static FOUND: std::sync::Mutex<Option<(std::time::Instant, Vec<bool>)>> = std::sync::Mutex::new(None);
+        let found = {
+            let mut cache = FOUND.lock().unwrap_or_else(|e| e.into_inner());
+            if cache.as_ref().is_none_or(|(t, _)| t.elapsed().as_secs() >= 5) {
+                *cache = Some((std::time::Instant::now(), TOOLS.iter().map(|(b, _)| crate::which_path(b).is_some()).collect()));
+            }
+            cache.as_ref().map(|(_, f)| f.clone()).unwrap_or_default()
+        };
+        // only umu-run is needed to play; the rest wait in a collapsed header
+        let tools = |ui: &mut Ui, id: &str, r: std::ops::Range<usize>| {
+            egui::Grid::new(id).num_columns(3).spacing([18.0, 8.0]).show(ui, |ui| {
+                for ((bin, what), found) in TOOLS[r.clone()].iter().zip(&found[r]) {
+                    ui.label(*bin);
+                    if *found {
+                        ui.label(RichText::new("installed").color(C::play()));
                     } else {
-                        let tx = app.tx.clone();
-                        std::thread::spawn(move || {
-                            let r = crate::delete_proton(Path::new(&value));
-                            let _ = tx.send(super::Ev::ProtonsChanged);
-                            let _ = tx.send(match r {
-                                Ok(()) => super::Ev::Note(None, "The Proton was deleted.".into(), false),
-                                Err(e) => super::Ev::Note(None, format!("{e:#}"), true),
+                        ui.label(RichText::new(format!("missing: {}", crate::install_hint(bin))).color(if *bin == "umu-run" { C::err() } else { C::accent() }));
+                    }
+                    ui.label(RichText::new(*what).color(C::sub()).small());
+                    ui.end_row();
+                }
+            });
+        };
+        tools(ui, "reqs", 0..1);
+        egui::CollapsingHeader::new("Optional tools").default_open(false).show(ui, |ui| tools(ui, "reqs2", 1..TOOLS.len()));
+
+        ui.add_space(22.0);
+        egui::CollapsingHeader::new(RichText::new("Advanced: Proton versions").heading()).default_open(false).show(ui, |ui| {
+            ui.label(RichText::new("Installed (each game picks one in its own settings):").color(C::sub()));
+            for (label, value) in app.protons.clone() {
+                let n = crate::proton_users(&app.lib.games, &app.protons, &value);
+                let used = match n {
+                    0 => "unused".to_string(),
+                    1 => "used by 1 game".into(),
+                    n => format!("used by {n} games"),
+                };
+                let path = Path::new(&value);
+                // only the user's own folders: never /usr, never umu's automatic "GE-Proton" entry
+                let own = path.parent().is_some_and(|p| p.ends_with("compatibilitytools.d")) && !path.starts_with("/usr");
+                ui.horizontal(|ui| {
+                    ui.label(if value == "GE-Proton" { label } else { format!("{label}    {value}") });
+                    ui.label(RichText::new(used).color(C::sub()));
+                    if !(own && n == 0) {
+                        return;
+                    }
+                    if app.confirm_proton.as_ref() != Some(&value) {
+                        if ui.add_enabled(!app.busy, egui::Button::new("Delete")).clicked() {
+                            app.confirm_proton = Some(value.clone());
+                        }
+                        return;
+                    }
+                    ui.label(RichText::new("Delete it? Steam games may still use it.").color(C::err()));
+                    if ui.button(RichText::new("Yes, delete").color(C::err())).clicked() {
+                        app.confirm_proton = None;
+                        if app.busy {
+                            app.say("a job is running: wait for it before deleting a Proton".to_string());
+                        } else if let Some(g) = app.lib.games.iter().find(|g| !crate::game_pids(g).is_empty()) {
+                            app.say(format!("{} is running: close it before deleting a Proton", g.name));
+                        } else {
+                            let tx = app.tx.clone();
+                            std::thread::spawn(move || {
+                                let r = crate::delete_proton(Path::new(&value));
+                                let _ = tx.send(super::Ev::ProtonsChanged);
+                                let _ = tx.send(match r {
+                                    Ok(()) => super::Ev::Note(None, "The Proton was deleted.".into(), false),
+                                    Err(e) => super::Ev::Note(None, format!("{e:#}"), true),
+                                });
                             });
+                        }
+                    }
+                    if ui.button("Keep it").clicked() {
+                        app.confirm_proton = None;
+                    }
+                });
+            }
+            if let Some(Ok(list)) = &app.releases
+                && let Some(rel) = crate::newer_ge(list, &app.protons).cloned()
+            {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("New: {} available", rel.tag)).color(C::accent()));
+                    if ui.add_enabled(!app.busy, egui::Button::new("Download")).clicked() {
+                        let tx = app.tx.clone();
+                        app.spawn_global(ui.ctx(), "Getting Proton", move |r| {
+                            crate::install_proton(&rel, &crate::compat_dir(), r)?;
+                            let _ = tx.send(super::Ev::ProtonsChanged);
+                            let _ = tx.send(super::Ev::Note(None, format!("{} is installed: pick it in a game's settings.", rel.tag), false));
+                            Ok(())
+                        });
+                    }
+                });
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.add_enabled(!app.busy, egui::Button::new("Find Proton releases")).clicked() {
+                    app.releases = None;
+                    let tx = app.tx.clone();
+                    std::thread::spawn(move || _ = tx.send(super::Ev::ProtonList(crate::proton_releases().map_err(|e| format!("{e:#}")))));
+                }
+            });
+            ui.label(RichText::new("GE-Proton suits most games; Proton-CachyOS and Proton-EM carry extra fixes for some newer ones.").color(C::sub()).small());
+            ui.add(egui::Label::new(RichText::new(format!("Downloads go to {}", crate::compat_dir().display())).color(C::sub()).small()).wrap());
+            match app.releases.clone() {
+                Some(Err(e)) => _ = ui.label(RichText::new(e).color(C::err())),
+                Some(Ok(list)) => {
+                    for (source, _) in crate::PROTON_SOURCES {
+                        ui.add_space(8.0);
+                        ui.label(RichText::new(source).color(C::accent()).strong());
+                        if !list.iter().any(|r| r.source == source) {
+                            ui.label(RichText::new("Could not be listed right now (GitHub's limit, or the project moved).").color(C::sub()).small());
+                        }
+                        egui::Grid::new(("releases", source)).num_columns(3).spacing([18.0, 8.0]).show(ui, |ui| {
+                            for rel in list.iter().filter(|r| r.source == source).take(6) {
+                                ui.label(&rel.tag);
+                                ui.label(RichText::new(gb(rel.size)).color(C::sub()));
+                                if app.protons.iter().any(|(folder, _)| rel.installed_as(folder)) {
+                                    ui.label(RichText::new("installed").color(C::sub()));
+                                } else if ui.add_enabled(!app.busy, egui::Button::new("Download")).clicked() {
+                                    let (rel, tx) = (rel.clone(), app.tx.clone());
+                                    app.spawn_global(ui.ctx(), "Getting Proton", move |r| {
+                                        crate::install_proton(&rel, &crate::compat_dir(), r)?;
+                                        let _ = tx.send(super::Ev::ProtonsChanged);
+                                        let _ = tx.send(super::Ev::Note(None, format!("{} is installed: pick it in a game's settings.", rel.tag), false));
+                                        Ok(())
+                                    });
+                                }
+                                ui.end_row();
+                            }
                         });
                     }
                 }
-                if ui.button("Keep it").clicked() {
-                    app.confirm_proton = None;
-                }
-            });
-        }
-        if let Some(Ok(list)) = &app.releases
-            && let Some(rel) = crate::newer_ge(list, &app.protons).cloned()
-        {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("New: {} available", rel.tag)).color(C::accent()));
-                if ui.add_enabled(!app.busy, egui::Button::new("Download")).clicked() {
-                    let tx = app.tx.clone();
-                    app.spawn_global(ui.ctx(), "Getting Proton", move |r| {
-                        crate::install_proton(&rel, &crate::compat_dir(), r)?;
-                        let _ = tx.send(super::Ev::ProtonsChanged);
-                        let _ = tx.send(super::Ev::Note(None, format!("{} is installed: pick it in a game's settings.", rel.tag), false));
-                        Ok(())
-                    });
-                }
-            });
-        }
-        ui.add_space(10.0);
-        ui.horizontal(|ui| {
-            if ui.add_enabled(!app.busy, egui::Button::new("Find Proton releases")).clicked() {
-                app.releases = None;
-                let tx = app.tx.clone();
-                std::thread::spawn(move || _ = tx.send(super::Ev::ProtonList(crate::proton_releases().map_err(|e| format!("{e:#}")))));
+                None => {}
             }
         });
-        ui.label(RichText::new("GE-Proton suits most games; Proton-CachyOS and Proton-EM carry extra fixes for some newer ones.").color(C::sub()).small());
-        ui.add(egui::Label::new(RichText::new(format!("Downloads go to {}", crate::compat_dir().display())).color(C::sub()).small()).wrap());
-        match app.releases.clone() {
-            Some(Err(e)) => _ = ui.label(RichText::new(e).color(C::err())),
-            Some(Ok(list)) => {
-                for (source, _) in crate::PROTON_SOURCES {
-                    ui.add_space(8.0);
-                    ui.label(RichText::new(source).color(C::accent()).strong());
-                    if !list.iter().any(|r| r.source == source) {
-                        ui.label(RichText::new("Could not be listed right now (GitHub's limit, or the project moved).").color(C::sub()).small());
-                    }
-                    egui::Grid::new(("releases", source)).num_columns(3).spacing([18.0, 8.0]).show(ui, |ui| {
-                        for rel in list.iter().filter(|r| r.source == source).take(6) {
-                            ui.label(&rel.tag);
-                            ui.label(RichText::new(gb(rel.size)).color(C::sub()));
-                            if app.protons.iter().any(|(folder, _)| rel.installed_as(folder)) {
-                                ui.label(RichText::new("installed").color(C::sub()));
-                            } else if ui.add_enabled(!app.busy, egui::Button::new("Download")).clicked() {
-                                let (rel, tx) = (rel.clone(), app.tx.clone());
-                                app.spawn_global(ui.ctx(), "Getting Proton", move |r| {
-                                    crate::install_proton(&rel, &crate::compat_dir(), r)?;
-                                    let _ = tx.send(super::Ev::ProtonsChanged);
-                                    let _ = tx.send(super::Ev::Note(None, format!("{} is installed: pick it in a game's settings.", rel.tag), false));
-                                    Ok(())
-                                });
-                            }
-                            ui.end_row();
-                        }
-                    });
-                }
-            }
-            None => {}
-        }
         ui.add_space(12.0);
     });
 }
@@ -512,7 +531,7 @@ fn disk_usage(app: &mut App, ui: &mut Ui) {
             let all = app.lib.games.iter().filter_map(|g| app.disk_rows.get(&g.dir)).fold([0u64; 3], |t, s| [t[0] + s[0], t[1] + s[1], t[2] + s[2]]);
             let done = app.lib.games.iter().all(|g| app.disk_rows.contains_key(&g.dir));
             let t = if done { "" } else { " …" };
-            ui.label(RichText::new(format!("Total {}{t} · games {} · Wine prefixes {} · repacks {}", gb(all.iter().sum()), gb(all[0]), gb(all[1]), gb(all[2]))).color(C::sub()));
+            ui.label(RichText::new(format!("Total {}{t} · games {} · game data folders {} · repacks {}", gb(all.iter().sum()), gb(all[0]), gb(all[1]), gb(all[2]))).color(C::sub()));
         });
     });
     note_line(app, ui, None);
@@ -560,7 +579,8 @@ fn settings(app: &mut App, ui: &mut Ui, i: usize) {
         }
         ui.vertical(|ui| {
             ui.label(RichText::new(&app.lib.games[i].name).heading());
-            ui.label(RichText::new("Settings").color(C::sub()));
+            let g = &app.lib.games[i];
+            ui.label(RichText::new(if !g.has_repack() { "Imported (your own files)" } else if g.status == Status::Installed { "Installed" } else { "Not installed" }).color(C::sub()));
         });
     });
     let g = app.lib.games[i].clone();
@@ -648,7 +668,9 @@ fn library(app: &mut App, ui: &mut Ui) {
     note_line(app, ui, None);
     watch_banners(app, ui);
     import_dialog(app, ui);
-    if ui.add_enabled(!app.scanning, egui::Button::new(if app.scanning { "Scanning…" } else { "Import a folder…" })).on_hover_text("add every repack and unpacked game inside a folder").clicked()
+    // nothing to scan for yet: a first-time user only needs Add game
+    if !app.lib.games.is_empty()
+        && ui.add_enabled(!app.scanning, egui::Button::new(if app.scanning { "Scanning…" } else { "Add many games…" })).on_hover_text("add every repack and unpacked game inside a folder").clicked()
         && let Some(dir) = rfd::FileDialog::new().set_title("A folder that holds repacks and games").pick_folder()
     {
         app.scanning = true;
@@ -661,7 +683,7 @@ fn library(app: &mut App, ui: &mut Ui) {
     if n == 0 && !app.lib.games.is_empty() {
         ui.label(RichText::new("No game matches the search.").color(C::sub()));
     } else if n == 0 {
-        ui.label(RichText::new("No games yet. Use \"Add game\" to pick a FitGirl repack folder (it gets installed) or a game that is already unpacked (it gets imported).").color(C::sub()));
+        ui.label(RichText::new("No games yet. Press Add game and choose the game's folder.").color(C::sub()));
         ui.add_space(8.0);
     }
     let mut open = None;
@@ -812,12 +834,12 @@ fn watch_banners(app: &mut App, ui: &mut Ui) {
     }
 }
 
-/// The checklist of what "Import a folder" found. Nothing is installed: repacks are added, games imported.
+/// The checklist of what "Add many games" found. Nothing is installed: repacks are added, games imported.
 fn import_dialog(app: &mut App, ui: &Ui) {
     let Some(mut items) = app.scan.take() else { return };
     let (mut add, mut cancel) = (false, false);
     let n = items.iter().filter(|(_, on)| *on).count();
-    egui::Window::new("Import a folder").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(ui.ctx(), |ui| {
+    egui::Window::new("Add many games").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(ui.ctx(), |ui| {
         for (f, on) in &mut items {
             let name = f.dir.file_name().unwrap_or_default().to_string_lossy();
             ui.checkbox(on, format!("{}: {name}", if f.repack { "Repack" } else { "Installed game" }));
@@ -829,7 +851,7 @@ fn import_dialog(app: &mut App, ui: &Ui) {
     });
     if add {
         let added = items.iter().filter(|(f, on)| *on && app.add_repack(f.dir.clone(), !f.repack).is_some()).count();
-        app.notify(None, format!("Added {added} game(s). Imported ones need SET UP on their page; nothing was installed."), false);
+        app.notify(None, format!("Added {added} game(s). Press FINISH SETUP once on each imported game, then PLAY; nothing was installed."), false);
         if let Some(i) = app.lib.games.len().checked_sub(1).filter(|_| added > 0) {
             app.want_game = Some(i);
         }
@@ -849,7 +871,7 @@ fn add_tile(ui: &Ui, rect: Rect, lit: bool) {
 /// One folder picker for both cases: a repack (has setup.exe) is added for installing, anything else is
 /// imported as an already-unpacked game and set up right away.
 fn add_game(app: &mut App, ui: &Ui) {
-    let Some(dir) = rfd::FileDialog::new().set_title("Game folder: a FitGirl repack, or a game that is already unpacked").pick_folder() else { return };
+    let Some(dir) = rfd::FileDialog::new().set_title("Choose the game's folder (a repack or an installed game)").pick_folder() else { return };
     let repack = find_setup(&dir).is_ok();
     if let Some(i) = app.add_repack(dir, !repack) {
         app.easy_open = Some(i);
@@ -857,7 +879,7 @@ fn add_game(app: &mut App, ui: &Ui) {
         let g = app.lib.games[i].clone();
         if !repack && g.kind == Kind::Windows {
             if app.busy || app.no_umu {
-                app.notify(Some(g.dir.clone()), "Imported. Press SET UP when the other job is done to create its Wine prefix.", false);
+                app.notify(Some(g.dir.clone()), "Added. Press FINISH SETUP once, then PLAY.", false);
             } else {
                 app.spawn(ui.ctx(), g, Job::Import);
             }
@@ -926,7 +948,6 @@ fn page(app: &mut App, ui: &mut Ui, i: usize) {
     if starting {
         ui.ctx().request_repaint_after(Duration::from_millis(500)); // to drop "Starting…" on time
     }
-    let emu = app.settings.emulator(g.kind).to_string();
     let side_free = if installed { None } else { crate::free_space(&g.dir) }; // not cached: space may be freed meanwhile
     let (has_prefix, has_emulator) = (app.side(&g).has_prefix, app.side(&g).has_emulator);
     let no_emu = g.kind != Kind::Windows && !has_emulator;
@@ -952,7 +973,7 @@ fn page(app: &mut App, ui: &mut Ui, i: usize) {
                 Primary::Install { .. } | Primary::SetUpPrefix if app.busy => ("QUEUE", C::install()),
                 Primary::Install { .. } if g.status == Status::Failed => ("INSTALL AGAIN", C::install()),
                 Primary::Install { .. } => ("INSTALL", C::install()),
-                Primary::SetUpPrefix => ("SET UP", C::install()),
+                Primary::SetUpPrefix => ("FINISH SETUP", C::install()),
                 Primary::SetUpEmulator => ("SET UP EMULATOR", C::install()),
             };
             let why = match primary {
@@ -974,7 +995,7 @@ fn page(app: &mut App, ui: &mut Ui, i: usize) {
                     Primary::Play => app.launch(i),
                     Primary::Install { .. } => app.spawn(ui.ctx(), g.clone(), Job::Install { verify: app.settings.verify, unattended: app.settings.unattended }),
                     Primary::SetUpPrefix => app.spawn(ui.ctx(), g.clone(), Job::Import),
-                    Primary::SetUpEmulator => app.easy_gear = true,
+                    Primary::SetUpEmulator => (app.global, app.scroll_to_emulators) = (true, true), // the emulator is set once for all games
                 }
             }
             ui.add_space(12.0);
@@ -983,11 +1004,15 @@ fn page(app: &mut App, ui: &mut Ui, i: usize) {
                     Primary::Install { space } => {
                         if let Some(need) = g.size {
                             let free = side_free.map(gb).unwrap_or("?".into());
-                            ui.label(RichText::new(format!("Needs {}, {} free", gb(need), free)).color(if space { C::sub() } else { C::err() }));
+                            let text = match side_free.filter(|f| !space && *f < need) {
+                                Some(f) => format!("Not enough space: needs {}, {} free. Free {} or change the games folder in Settings.", gb(need), gb(f), gb(need - f)),
+                                None => format!("Needs {}, {} free", gb(need), free),
+                            };
+                            ui.label(RichText::new(text).color(if space { C::sub() } else { C::err() }));
                         }
                     }
-                    Primary::SetUpEmulator => _ = ui.label(RichText::new(if emu.is_empty() { "No emulator set for this type of game yet." } else { "The emulator file is missing." }).color(C::sub())),
-                    Primary::SetUpPrefix => _ = ui.label(RichText::new("Creates its Wine prefix with the runtimes the game ships.").color(C::sub())),
+                    Primary::SetUpEmulator => _ = ui.label(RichText::new("This game needs an emulator. Pick one in Settings, Emulators.").color(C::sub())),
+                    Primary::SetUpPrefix => _ = ui.label(RichText::new("One-time step before the first PLAY.").color(C::sub())),
                     Primary::Play if g.steam.is_some() => _ = ui.label(RichText::new("Starts through Steam").color(C::sub())),
                     Primary::Play => {}
                 }
@@ -1012,7 +1037,7 @@ fn page(app: &mut App, ui: &mut Ui, i: usize) {
                             let to = &ups[ups.len() - 1].to;
                             ui.label(RichText::new(format!("Update available: v{to}")).color(C::accent()).strong())
                                 .on_hover_text(ups.iter().map(|u| u.dir.display().to_string()).collect::<Vec<_>>().join("\n"));
-                            if ui.small_button("Review").on_hover_text("opens Updates in this game's settings; you press Apply").clicked() {
+                            if ui.small_button("Update").on_hover_text("See what changes and apply it").clicked() {
                                 app.select(Some(i));
                                 app.pending = Ok(ups.clone());
                                 app.easy_gear = true;
@@ -1052,11 +1077,18 @@ fn page(app: &mut App, ui: &mut Ui, i: usize) {
         // the one-click fix for why the game stopped right away
         if let Some((_, fix)) = app.fix.clone().filter(|(d, _)| *d == g.dir) {
             let label = match &fix {
-                crate::Fix::Winetricks(v) => format!("Install {v}"),
+                crate::Fix::Winetricks(_) => "Fix it (installs a Windows component)".to_string(),
                 crate::Fix::Proton(p) => format!("Use {}", Path::new(p).file_name().map_or(p.clone(), |n| n.to_string_lossy().into_owned())),
             };
             let winetricks = matches!(fix, crate::Fix::Winetricks(_));
-            if ui.add_enabled(!app.busy_with(&g) && !(winetricks && app.no_winetricks), egui::Button::new(label)).on_disabled_hover_text(format!("winetricks is not installed: {}", crate::install_hint("winetricks"))).clicked() {
+            if ui.add_enabled(!app.busy_with(&g) && !(winetricks && app.no_winetricks), egui::Button::new(label))
+                .on_hover_text(match &fix {
+                    crate::Fix::Winetricks(v) => format!("installs {v} with winetricks"),
+                    crate::Fix::Proton(_) => "switches this game to that compatibility version".to_string(),
+                })
+                .on_disabled_hover_text(format!("winetricks is not installed: {}", crate::install_hint("winetricks")))
+                .clicked()
+            {
                 app.fix = None;
                 match fix {
                     crate::Fix::Winetricks(v) => app.spawn(ui.ctx(), g.clone(), Job::Winetricks(vec![v.to_string()])),
@@ -1064,14 +1096,19 @@ fn page(app: &mut App, ui: &mut Ui, i: usize) {
                         app.lib.games[i].proton = p;
                         app.save();
                         app.write_script(i);
-                        app.notify(Some(g.dir.clone()), "Proton changed: press Play to try again.", false);
+                        app.notify(Some(g.dir.clone()), "Changed. Press PLAY to try again.", false);
                     }
                 }
             }
         }
     } else if g.status == Status::Failed && !busy_here {
         ui.add_space(6.0);
-        ui.label(RichText::new("The last install did not finish. Settings has the log.").color(C::err()));
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("The install failed. Press INSTALL AGAIN to retry.").color(C::err()));
+            if ui.small_button("Show log").clicked() {
+                (app.easy_gear, app.scroll_to_log) = (true, true);
+            }
+        });
     }
     ui.add_space(28.0);
 

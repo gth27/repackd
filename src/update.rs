@@ -260,7 +260,7 @@ fn copy_tree(from: &Path, to: &Path, n: &mut usize, log: &impl Report) -> Result
 /// the files it changes are copied first (`undo`).
 pub fn apply(g: &Game, u: &Update, verify_first: bool, backup: bool, log: &impl Report) -> Result<()> {
     if !crate::game_pids(g).is_empty() {
-        bail!("{} is running: close it first (an update over a running game can leave half-written files)", g.name);
+        bail!("{} is running: an update over a running game can leave half-written files. Close it, or press Stop game on its page.", g.name);
     }
     let backup = backup.then_some(u.to.as_str());
     // no size-based progress: the game folder is already full size, so the bar would sit at 100%
@@ -379,7 +379,7 @@ fn run_update(g: &Game, dir: &Path, scene: Option<PathBuf>, log: &impl Report) -
     crate::cancel_point(log)?;
     let Some(scene) = scene else {
         if let Ok(setup) = find_setup(dir) {
-            log.step("Updating: a setup window will open: click Next / Install / Finish in it.");
+            log.step(crate::STEP_WAIT_WINDOW);
             run_inno(g, &setup, false, log)?;
             return install_redists(g, log); // blocked during its setup like the base game's
         }
@@ -387,7 +387,7 @@ fn run_update(g: &Game, dir: &Path, scene: Option<PathBuf>, log: &impl Report) -
     };
     if let Ok(setup) = find_setup(&scene) {
         // the Inno log still says whether it finished (RUNE's own page aborts when run silently anyway)
-        log.step("Updating: a setup window will open: click Next / Install / Finish in it.");
+        log.step(crate::STEP_WAIT_WINDOW);
         log.log(format!("In the update's window check the folder is {} and press Install; repackd copies the crack afterwards.", g.install_dir_win()));
         run_inno(g, &setup, false, log)?;
     } else if let Some(patch) = patch_exe(&scene) {
@@ -593,7 +593,7 @@ pub fn undo(g: &Game, log: &impl Report) -> Result<(String, String)> {
         bail!("the newest backup is from v{} to v{}, but the game is at v{}: it can't be undone safely", m.from, m.to, g.version);
     }
     if !prefix_pids(&g.prefix()).is_empty() {
-        bail!("{} is running: close it first", g.name);
+        bail!("{} is running. Close it, or press Stop game on its page.", g.name);
     }
     log.step(&format!("Undoing the update to v{}", m.to));
     let inst = g.install_dir();

@@ -42,6 +42,8 @@ enum Ev {
     StartFailed(PathBuf, String, Option<crate::Fix>),
     /// A game was played: its dir, when it started (Unix time), for how many seconds.
     Played(PathBuf, u64, u64),
+    /// The launch watcher gave up without a game to time (could not start, Steam never showed it).
+    NotPlaying(PathBuf),
     /// A game was deleted: drop it from the library (by its dir).
     Removed(PathBuf),
     /// A game's folder was moved: old dir, new dir.
@@ -179,6 +181,8 @@ pub struct App {
     job_label: &'static str,
     /// A game just started: its dir and when, to show "Starting…" and stop double launches.
     launching: Option<(PathBuf, Instant)>,
+    /// Game dirs whose launch watcher is running (the game page shows "Stop game"; no /proc scan per frame).
+    playing: std::collections::HashSet<PathBuf>,
     /// The store-id field as typed (a pasted store URL is fine), and a save backup waiting for "Yes, restore".
     store_text: String,
     confirm_restore: Option<PathBuf>,
@@ -300,6 +304,7 @@ impl App {
             job_game: None,
             job_label: "",
             launching: None,
+            playing: Default::default(),
             store_text: String::new(),
             confirm_restore: None,
             styled: false,
@@ -727,7 +732,9 @@ impl App {
                     self.notify(Some(dir.clone()), text, true);
                     self.fix = fix.map(|f| (dir, f));
                 }
+                Ev::NotPlaying(dir) => _ = self.playing.remove(&dir),
                 Ev::Played(dir, at, secs) => {
+                    self.playing.remove(&dir);
                     let Some(g) = self.lib.games.iter_mut().find(|g| g.dir == dir) else { continue };
                     g.playtime += secs;
                     g.last_played = Some(at);
@@ -865,7 +872,7 @@ impl App {
                 }
                 Job::Winetricks(verbs) => {
                     let mut c = g.umu();
-                    c.arg("winetricks").args(verbs);
+                    c.arg("winetricks").arg("-q").args(verbs);
                     run(c, &log).map(|st| log(format!("winetricks finished ({st})")))
                 }
             };
@@ -1637,7 +1644,9 @@ impl App {
         // the 8 s "Starting…" guard is shorter than many games take to show a window
         if !crate::game_pids(g).is_empty() {
             let dir = g.dir.clone();
-            return self.notify(Some(dir), "Already running.", false);
+            self.notify(Some(dir.clone()), "Already running.", false);
+            self.fix = Some((dir, crate::Fix::Stop));
+            return;
         }
         let via_steam = g.steam_appid.filter(|_| g.steam.is_some());
         let mut c = match via_steam {
@@ -1659,6 +1668,7 @@ impl App {
         // another Proton to suggest when the game crashes under this one
         let other = (g.kind == Kind::Windows).then(|| self.protons.iter().map(|(_, v)| v.clone()).find(|v| *v != g.proton)).flatten();
         self.launching = Some((g.dir.clone(), Instant::now()));
+        self.playing.insert(g.dir.clone());
         self.side = None; // last-run.log now exists
         let (tx, dir, game, ctx) = (self.tx.clone(), g.dir.clone(), g.clone(), self.ctx.clone());
         std::thread::spawn(move || {
@@ -1673,6 +1683,7 @@ impl App {
             };
             match status {
                 Err(e) => {
+                    let _ = tx.send(Ev::NotPlaying(dir.clone()));
                     let _ = tx.send(Ev::Note(Some(dir), format!("could not start: {e}"), true));
                     return;
                 }
@@ -1692,6 +1703,7 @@ impl App {
                 // until the game is up (Steam may take a while); its playtime starts then
                 while crate::game_pids(&game).is_empty() {
                     if t.elapsed() > Duration::from_secs(180) {
+                        let _ = tx.send(Ev::NotPlaying(dir));
                         return;
                     }
                     std::thread::sleep(Duration::from_secs(2));

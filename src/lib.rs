@@ -707,7 +707,7 @@ pub fn delete_files(root: &Path, g: &Game) -> Result<()> {
         bail!("refusing to delete {}: not inside {}", g.dir.display(), root.display());
     }
     if !game_pids(g).is_empty() {
-        bail!("{} is running (game, installer or tool): close it or press Cancel first", g.name);
+        bail!("{} is running (game, installer or tool). Close it, or press Stop game on its page.", g.name);
     }
     if g.steam.is_some() && steam::running() {
         bail!("close Steam first: this game has a Steam shortcut to remove");
@@ -1214,7 +1214,7 @@ pub fn game_pids(g: &Game) -> Vec<u32> {
 /// Unpack a backup over the profile: files in it replace the current ones, others are left alone.
 pub fn restore_saves(g: &Game, archive: &Path) -> Result<()> {
     if !prefix_pids(&g.prefix()).is_empty() {
-        bail!("{} is running: close it first, or it writes its own saves over the restored ones when it exits", g.name);
+        bail!("{} is running: it would write its own saves over the restored ones when it exits. Close it, or press Stop game on its page.", g.name);
     }
     let prof = profile(g);
     std::fs::create_dir_all(&prof)?;
@@ -1572,6 +1572,9 @@ pub fn check(md5: &Path, log: &impl Report) -> Result<()> {
 // ---------- install ----------
 
 const LOG_WIN: &str = r"C:\repackd-install.log";
+const STEP_UNPACK: &str = "Unpacking (FitGirl's setup.exe)";
+pub(crate) const STEP_WAIT_WINDOW: &str = "Waiting for you in the installer window (it may be behind other windows)";
+const STEP_FIRST_START: &str = "First start: downloading the game runtime (can take several minutes)";
 
 const BASE_OVERRIDES: &str = "winebrowser.exe=d;winemenubuilder.exe=d";
 /// Started by FitGirl's setup without silent flags, so each waits for a click even in a silent install:
@@ -1603,23 +1606,28 @@ pub fn log_errors(text: &str) -> Vec<String> {
 pub fn run_inno(g: &Game, setup: &Path, unattended: bool, log: &impl Report) -> Result<()> {
     let logf = g.prefix().join("drive_c/repackd-install.log");
     let _ = std::fs::remove_file(&logf); // a log from an earlier attempt would hide this one's result
+    // the heading stall_watch puts back once the install shows progress
+    let step = if unattended { STEP_UNPACK } else { STEP_WAIT_WINDOW };
+    log.step(if g.prefix().join("drive_c").is_dir() { step } else { STEP_FIRST_START });
     g.map_game_drive(log)?;
     let mut c = g.umu();
     c.env("WINEDLLOVERRIDES", format!("{BASE_OVERRIDES};{SETUP_BLOCKED}"));
     c.arg(setup).args(inno_args(&g.install_dir_win(), unattended));
     let c = memory_scope(c);
     log.log(format!("running {}", setup.display()));
-    let done = AtomicBool::new(false);
+    let (done, killed) = (AtomicBool::new(false), AtomicBool::new(false));
     // a walk of the whole game each time: often enough for the bar, rarely when there is no bar (updates)
     let every = Duration::from_secs(if g.size.is_some() { 15 } else { 60 });
     let st = std::thread::scope(|s| {
-        s.spawn(|| stall_watch(&g.install_dir(), g.size, &done, every, Duration::from_secs(300), log));
+        s.spawn(|| stall_watch(&g.install_dir(), g.size, &done, every, Duration::from_secs(300), step, log));
+        s.spawn(|| closed_watch(&logf, &g.prefix(), &done, &killed, Duration::from_secs(3), Duration::from_secs(30), log));
         let r = run(c, log);
         done.store(true, Ordering::Relaxed);
         r
     })?;
     let text = String::from_utf8_lossy(&std::fs::read(&logf).unwrap_or_default()).into_owned();
-    inno_result(st.success(), &text, log)
+    // a setup we killed after "Log closed." exits by SIGKILL: the log decides, as for any exit
+    inno_result(st.success() || killed.load(Ordering::Relaxed), &text, log)
 }
 
 /// Run inside its own systemd scope with `MemoryHigh` at half the RAM. FitGirl's unpacker sizes itself at
@@ -1651,7 +1659,7 @@ pub fn dir_size(d: &Path) -> u64 {
 pub fn move_refusal(g: &Game, to_parent: &Path) -> Result<()> {
     let new = to_parent.join(g.dir.file_name().context("the game folder has no name")?);
     if !game_pids(g).is_empty() {
-        bail!("{} is running (game, installer or tool): close it first", g.name);
+        bail!("{} is running (game, installer or tool). Close it, or press Stop game on its page.", g.name);
     }
     if g.steam.is_some() && steam::running() {
         bail!("close Steam first: this game has a Steam shortcut that must be updated");
@@ -1774,9 +1782,9 @@ pub fn move_game(g: &Game, to_parent: &Path, log: &impl Report) -> Result<PathBu
 
 /// FitGirl's unpacker shows its own error dialog even in silent mode and then waits forever, so a setup
 /// that stops writing for `stall` gets one hint in the log (it can't be killed blindly: redist installers
-/// at the end also write nothing for a while).
-fn stall_watch(dir: &Path, total: Option<u64>, done: &AtomicBool, every: Duration, stall: Duration, log: &impl Report) {
-    let (mut size, mut since, mut warned) = (0, Instant::now(), false);
+/// at the end also write nothing for a while). The step heading says it too, and `resume` once it grows again.
+fn stall_watch(dir: &Path, total: Option<u64>, done: &AtomicBool, every: Duration, stall: Duration, resume: &str, log: &impl Report) {
+    let (mut size, mut since, mut warned, mut off) = (0, Instant::now(), false, true);
     let mut next = Instant::now() + every;
     while !done.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(200).min(every));
@@ -1785,6 +1793,10 @@ fn stall_watch(dir: &Path, total: Option<u64>, done: &AtomicBool, every: Duratio
         }
         next = Instant::now() + every;
         let now = dir_size(dir);
+        if now != size && off {
+            log.step(resume); // before progress: a step resets the bar
+            off = false;
+        }
         if let Some(t) = total {
             log.progress(now.min(t), t);
         }
@@ -1795,8 +1807,47 @@ fn stall_watch(dir: &Path, total: Option<u64>, done: &AtomicBool, every: Duratio
                 "no progress for {} min. If a window with an error appears, press Cancel, then INSTALL AGAIN.",
                 stall.as_secs() / 60
             ));
-            warned = true;
+            log.step(&format!("No progress for {} min — an error window may be open. Press Cancel, then INSTALL AGAIN.", stall.as_secs() / 60));
+            (warned, off) = (true, true);
         }
+    }
+}
+
+/// Inno's last log line, "Log closed.", means setup is over. A game it started at its end (or a stuck helper)
+/// keeps umu-run alive, so the install would never finish.
+fn log_closed(text: &str) -> bool {
+    text.lines().rev().find(|l| !l.trim().is_empty()).is_some_and(|l| l.trim_end().ends_with("Log closed."))
+}
+
+/// Once the setup log is closed and umu-run is still there `grace` later, close what setup left open.
+fn closed_watch(logf: &Path, pfx: &Path, done: &AtomicBool, killed: &AtomicBool, every: Duration, grace: Duration, log: &impl Report) {
+    let tail = || {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = std::fs::File::open(logf).ok()?;
+        if f.seek(SeekFrom::End(-4096)).is_err() {
+            f.rewind().ok()?; // a log shorter than the tail
+        }
+        let mut b = vec![];
+        f.read_to_end(&mut b).ok()?;
+        Some(String::from_utf8_lossy(&b).into_owned())
+    };
+    let sleep = |d: Duration| {
+        let t = Instant::now();
+        while !done.load(Ordering::Relaxed) && t.elapsed() < d {
+            std::thread::sleep(Duration::from_millis(100).min(d));
+        }
+    };
+    while !done.load(Ordering::Relaxed) {
+        if tail().is_some_and(|t| log_closed(&t)) {
+            sleep(grace);
+            if !done.load(Ordering::Relaxed) {
+                log.log("Setup finished, closing what it left open (e.g. a game it started).".into());
+                killed.store(true, Ordering::Relaxed);
+                kill_prefix(pfx);
+            }
+            return;
+        }
+        sleep(every);
     }
 }
 
@@ -1804,7 +1855,7 @@ fn inno_result(ok: bool, text: &str, log: &impl Report) -> Result<()> {
     let errs = log_errors(text);
     // a killed or crashed setup still exits 0 through umu and leaves a partial game dir; only a setup that
     // ran to its end writes "Log closed."
-    let finished = text.lines().rev().find(|l| !l.trim().is_empty()).is_some_and(|l| l.trim_end().ends_with("Log closed."));
+    let finished = log_closed(text);
     if ok && errs.is_empty() && finished {
         return Ok(());
     }
@@ -1843,22 +1894,49 @@ pub fn prefix_pids(pfx: &Path) -> Vec<u32> {
     out
 }
 
-/// Run with stdout and stderr streamed to `log` line by line.
+/// Run with stdout and stderr streamed to `log` line by line. When the command ends, what it left running in
+/// its prefix (`WINEPREFIX`) is killed, because that holds the pipes open forever; a reader still stuck 5 s
+/// after that is given up on.
 pub fn run(mut c: Command, log: &impl Report) -> Result<ExitStatus> {
-    let mut child = c.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().with_context(|| format!("start {:?}", c.get_program()))?;
+    // a prefix with processes already (a game) is not ours to clean
+    let pfx = c.get_envs().find_map(|(k, v)| v.filter(|_| k == "WINEPREFIX")).map(PathBuf::from).filter(|p| prefix_pids(p).is_empty());
+    let mut child = c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().with_context(|| format!("start {:?}", c.get_program()))?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    // detached readers: a pipe held open by an orphan can't be joined; they end with it (or when `rx` is gone)
     let (out, err) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
+    let t2 = tx.clone();
+    std::thread::spawn(move || BufReader::new(out).lines().map_while(Result::ok).try_for_each(|l| tx.send(l)));
+    std::thread::spawn(move || BufReader::new(err).lines().map_while(Result::ok).try_for_each(|l| t2.send(l)));
+    let exited = AtomicBool::new(false);
+    let exited = &exited;
     std::thread::scope(|s| {
-        s.spawn(|| BufReader::new(out).lines().map_while(Result::ok).for_each(|l| log.log(l)));
-        BufReader::new(err).lines().map_while(Result::ok).for_each(|l| log.log(l));
-    });
-    Ok(child.wait()?)
+        s.spawn(move || {
+            let mut until = None;
+            loop {
+                match rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(l) => log.log(l),
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(_) => {}
+                }
+                if exited.load(Ordering::Relaxed) && *until.get_or_insert(Instant::now() + Duration::from_secs(5)) <= Instant::now() {
+                    break;
+                }
+            }
+        });
+        let st = child.wait();
+        if let Some(p) = &pfx {
+            kill_prefix(p); // the child is reaped: only its orphans (and the tagged 7z, long done) are left
+        }
+        exited.store(true, Ordering::Relaxed);
+        Ok(st?)
+    })
 }
 
 /// Everything an install checks before it changes anything: the repack's files, its setup.exe, disk space.
 /// A failure here leaves an installed game as it was (still playable). Returns setup.exe.
 pub fn install_checks(g: &Game, verify_first: bool, log: &impl Report) -> Result<PathBuf> {
     if !game_pids(g).is_empty() {
-        bail!("{} is running: close it first (installing over a running game breaks both)", g.name);
+        bail!("{} is running: installing over a running game breaks both. Close it, or press Stop game on its page.", g.name);
     }
     if g.proton_path() == "GE-Proton" && !protons().iter().any(|(l, v)| v.contains('/') && l.starts_with("GE-Proton")) {
         log.log("The first start downloads Proton (about 500 MB).".into());
@@ -1888,7 +1966,6 @@ pub fn install_checks(g: &Game, verify_first: bool, log: &impl Report) -> Result
 /// Install from setup.exe (after `install_checks`), then the runtimes and FitGirl's after-install check.
 pub fn install(g: &Game, setup: &Path, verify_first: bool, unattended: bool, log: &impl Report) -> Result<()> {
     std::fs::create_dir_all(&g.dir)?;
-    log.step("Unpacking (FitGirl's setup.exe)");
     run_inno(g, setup, unattended, log)?;
     cancel_point(log)?;
     if !g.install_dir().is_dir() {
@@ -1917,7 +1994,7 @@ pub fn prepare_import(g: &Game, log: &impl Report) -> Result<()> {
 }
 
 fn create_prefix(g: &Game, log: &impl Report) -> Result<()> {
-    log.step("Creating the Wine prefix");
+    log.step(STEP_FIRST_START);
     let mut c = g.umu();
     c.args(["wineboot", "-u"]);
     let st = run(c, log)?;
@@ -2122,6 +2199,8 @@ pub enum Fix {
     Winetricks(&'static str),
     /// Try this Proton (a `Game::proton` value).
     Proton(String),
+    /// Kill the game's prefix ("Already running.").
+    Stop,
 }
 
 /// Read a game's output (Wine/Proton log lines) after it stopped right away: the likely cause in plain words,
@@ -3025,7 +3104,7 @@ mod tests {
         let d = tmp("stall");
         let (done, lines) = (AtomicBool::new(false), std::sync::Mutex::new(vec![]));
         std::thread::scope(|s| {
-            s.spawn(|| stall_watch(&d, None, &done, Duration::from_millis(20), Duration::from_millis(100), &|l| lines.lock().unwrap().push(l)));
+            s.spawn(|| stall_watch(&d, None, &done, Duration::from_millis(20), Duration::from_millis(100), "x", &|l| lines.lock().unwrap().push(l)));
             std::thread::sleep(Duration::from_millis(400));
             done.store(true, Ordering::Relaxed);
         });
@@ -3045,6 +3124,7 @@ mod tests {
         let ok = "Log opened.\nInstallation process succeeded.\n2026-10-22 19:13:13.643   Log closed.\r\n\r\n";
         let killed = "Log opened.\nInstallation process succeeded.\n";
         let bad = "Log opened.\nMessage box (OK):\nISDone.dll: An error occurred when unpacking! Unarc.dll returned an error code: -1\nRolling back changes.\n";
+        assert!(log_closed(ok) && !log_closed(killed) && !log_closed(bad) && !log_closed(""));
         assert!(log_errors(ok).is_empty());
         assert_eq!(log_errors(bad).len(), 2);
         assert!(inno_result(true, ok, &|_| {}).is_ok());

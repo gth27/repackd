@@ -1016,6 +1016,10 @@ fn page(app: &mut App, ui: &mut Ui, i: usize) {
                     Primary::Play if g.steam.is_some() => _ = ui.label(RichText::new("Starts through Steam").color(C::sub())),
                     Primary::Play => {}
                 }
+                if matches!(primary, Primary::Play) && app.playing.contains(&g.dir) && ui.button("Stop game").on_hover_text("Closes the game and everything it left running").clicked() {
+                    let pfx = g.prefix();
+                    std::thread::spawn(move || _ = crate::kill_prefix(&pfx)); // the watcher then sees no pids and sends Played
+                }
                 if !g.version.is_empty() {
                     ui.label(RichText::new(format!("Version {}", g.version)).color(C::sub()));
                 }
@@ -1079,18 +1083,24 @@ fn page(app: &mut App, ui: &mut Ui, i: usize) {
             let label = match &fix {
                 crate::Fix::Winetricks(_) => "Fix it (installs a Windows component)".to_string(),
                 crate::Fix::Proton(p) => format!("Use {}", Path::new(p).file_name().map_or(p.clone(), |n| n.to_string_lossy().into_owned())),
+                crate::Fix::Stop => "Stop it".to_string(),
             };
             let winetricks = matches!(fix, crate::Fix::Winetricks(_));
-            if ui.add_enabled(!app.busy_with(&g) && !(winetricks && app.no_winetricks), egui::Button::new(label))
+            if ui.add_enabled((!app.busy_with(&g) || fix == crate::Fix::Stop) && !(winetricks && app.no_winetricks), egui::Button::new(label))
                 .on_hover_text(match &fix {
                     crate::Fix::Winetricks(v) => format!("installs {v} with winetricks"),
                     crate::Fix::Proton(_) => "switches this game to that compatibility version".to_string(),
+                    crate::Fix::Stop => "Closes the game and everything it left running".to_string(),
                 })
                 .on_disabled_hover_text(format!("winetricks is not installed: {}", crate::install_hint("winetricks")))
                 .clicked()
             {
                 app.fix = None;
                 match fix {
+                    crate::Fix::Stop => {
+                        let pfx = g.prefix();
+                        std::thread::spawn(move || _ = crate::kill_prefix(&pfx));
+                    }
                     crate::Fix::Winetricks(v) => app.spawn(ui.ctx(), g.clone(), Job::Winetricks(vec![v.to_string()])),
                     crate::Fix::Proton(p) => {
                         app.lib.games[i].proton = p;

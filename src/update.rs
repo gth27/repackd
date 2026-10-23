@@ -373,7 +373,6 @@ fn run_update(g: &Game, dir: &Path, scene: Option<PathBuf>, log: &impl Report) -
     crate::cancel_point(log)?;
     let Some(scene) = scene else {
         if let Ok(setup) = find_setup(dir) {
-            log.step(crate::STEP_WAIT_WINDOW);
             run_inno(g, &setup, false, log)?;
             return install_redists(g, log); // blocked during its setup like the base game's
         }
@@ -381,8 +380,7 @@ fn run_update(g: &Game, dir: &Path, scene: Option<PathBuf>, log: &impl Report) -
     };
     if let Ok(setup) = find_setup(&scene) {
         // the Inno log still says whether it finished (RUNE's own page aborts when run silently anyway)
-        log.step(crate::STEP_WAIT_WINDOW);
-        log.log(format!("In the update's window check the folder is {} and press Install; repackd copies the crack afterwards.", g.install_dir_win()));
+        log.log(format!("In the update's window check the folder is {} (drive G:) and press Install; repackd copies the crack afterwards.", g.install_dir_win()));
         run_inno(g, &setup, false, log)?;
     } else if let Some(patch) = patch_exe(&scene) {
         gui_patch(g, &patch, log)?;
@@ -611,15 +609,15 @@ pub fn undo(g: &Game, log: &impl Report) -> Result<(String, String)> {
 /// A scene patcher with its own window and no silent mode (TENOKE's HDiffPatch `PATCH.exe`): the user picks
 /// the game folder in it. Closing it without patching changes no game file, and that is an error, not an update.
 fn gui_patch(g: &Game, exe: &Path, log: &impl Report) -> Result<()> {
-    log.step("Patching: pick the game folder in the patcher's window");
-    log.log(format!("In the patcher, choose the folder {} and start it; close the patcher when it is done.", g.install_dir_win()));
+    log.step("Patching: in the patcher's window choose drive G: (the game's folder), then start it");
+    log.log(format!("In the patcher, choose drive G: (that is {}) and start it; close the patcher when it is done.", g.install_dir_win()));
     g.map_game_drive(log)?;
     let start = SystemTime::now();
     let mut c = g.umu();
     c.current_dir(exe.parent().unwrap_or(exe)).arg(exe);
     let st = run(c, g.exe.as_deref(), log)?;
     if !changed_since(&g.install_dir(), start) {
-        bail!("the patcher changed no game files ({st}): apply the update again and pick {}", g.install_dir_win());
+        bail!("the patcher changed no game files ({st}): apply the update again and pick drive G: ({})", g.install_dir_win());
     }
     Ok(())
 }

@@ -345,14 +345,27 @@ impl Game {
     /// root as its dir). Under Z: (all of `/`), installers that check the free space of the target's drive root
     /// get the root filesystem's instead of the game disk's: RUNE's KCD2 update refused a disk with 291 GB free.
     pub fn map_game_drive(&self, log: &impl Report) -> Result<()> {
-        let Some(dir) = &self.game_dir else { return Ok(()) };
+        let installed = self.install_dir().is_dir();
+        if self.game_dir.is_none() && !installed {
+            return Ok(());
+        }
         let dev = self.prefix().join("dosdevices");
         if !dev.is_dir() {
             create_prefix(self, log)?;
         }
-        let link = dev.join("r:");
-        let _ = std::fs::remove_file(&link);
-        std::os::unix::fs::symlink(dir.parent().unwrap_or(dir), &link).context("map drive R: to the game's folder")
+        let link = |letter: &str, to: &Path| {
+            let l = dev.join(letter);
+            let _ = std::fs::remove_file(&l);
+            std::os::unix::fs::symlink(to, &l).with_context(|| format!("map drive {} to {}", letter.to_uppercase(), to.display()))
+        };
+        if let Some(dir) = &self.game_dir {
+            link("r:", dir.parent().unwrap_or(dir))?;
+        }
+        // G: is the game itself: update installers and patchers that ask where it is get a one-click answer
+        if installed {
+            link("g:", &self.install_dir())?;
+        }
+        Ok(())
     }
     /// The game's folder was moved from `self.dir` to `new`: point every stored path under it at the new place.
     pub fn moved_to(&mut self, new: &Path) {
@@ -1710,6 +1723,7 @@ pub fn check(md5: &Path, log: &impl Report) -> Result<()> {
 const LOG_WIN: &str = r"C:\repackd-install.log";
 const STEP_UNPACK: &str = "Unpacking (FitGirl's setup.exe)";
 pub(crate) const STEP_WAIT_WINDOW: &str = "Waiting for you in the installer window (it may be behind other windows)";
+pub(crate) const STEP_WAIT_UPDATE: &str = "Waiting for you in the update's window. If it asks where the game is, choose drive G: (the game's folder)";
 const STEP_FIRST_START: &str = "First start: downloading the game runtime (can take several minutes)";
 
 const BASE_OVERRIDES: &str = "winebrowser.exe=d;winemenubuilder.exe=d";
@@ -1743,7 +1757,7 @@ pub fn run_inno(g: &Game, setup: &Path, unattended: bool, log: &impl Report) -> 
     let logf = g.prefix().join("drive_c/repackd-install.log");
     let _ = std::fs::remove_file(&logf); // a log from an earlier attempt would hide this one's result
     // the heading stall_watch puts back once the install shows progress
-    let step = if unattended { STEP_UNPACK } else { STEP_WAIT_WINDOW };
+    let step = if unattended { STEP_UNPACK } else if g.install_dir().is_dir() { STEP_WAIT_UPDATE } else { STEP_WAIT_WINDOW };
     log.step(if g.prefix().join("drive_c").is_dir() { step } else { STEP_FIRST_START });
     g.map_game_drive(log)?;
     let mut c = g.umu();
@@ -3416,6 +3430,7 @@ mod tests {
         std::fs::create_dir_all(g.prefix().join("dosdevices")).unwrap();
         g.map_game_drive(&|_| {}).unwrap();
         assert_eq!(std::fs::read_link(g.prefix().join("dosdevices/r:")).unwrap(), d);
+        assert_eq!(std::fs::read_link(g.prefix().join("dosdevices/g:")).unwrap(), gd, "G: is the game itself, for update windows");
         assert!(!g.has_repack());
         assert!(lib.import(gd.clone()).unwrap_err().to_string().contains("already"));
         std::fs::create_dir_all(lib.games[i].prefix()).unwrap();

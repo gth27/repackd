@@ -1453,7 +1453,7 @@ impl App {
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.verbs).hint_text("winetricks verbs, e.g. vcrun2022 d3dx9").desired_width(380.0));
                 let verbs: Vec<String> = self.verbs.split_whitespace().map(String::from).collect();
-                let why = if self.no_winetricks { "winetricks is not installed: sudo pacman -S winetricks" } else { "type the verbs first" };
+                let why = if self.no_winetricks { format!("winetricks is not installed: {}", crate::install_hint("winetricks")) } else { "type the verbs first".into() };
                 if ui.add_enabled(idle && !verbs.is_empty() && !self.no_umu && !self.no_winetricks, egui::Button::new("Run winetricks")).on_disabled_hover_text(why).clicked() {
                     self.spawn(&ctx, g.clone(), Job::Winetricks(verbs));
                 }

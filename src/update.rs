@@ -308,7 +308,7 @@ fn extract(archive: &Path, to: &Path, prefix: &Path, log: &impl Report) -> Resul
         c.args(["x", "-o+", "-idq"]).arg(archive).arg(format!("{}/", to.display()));
         c
     } else {
-        bail!("unpacking update archives needs 7-Zip: sudo pacman -S 7zip");
+        bail!("unpacking update archives needs 7-Zip: {}", crate::install_hint("7z"));
     };
     c.stdin(Stdio::null()); // a password prompt must fail, not wait
     // Cancel and closing repackd stop a job's processes by their WINEPREFIX: tag 7-Zip so they stop it too

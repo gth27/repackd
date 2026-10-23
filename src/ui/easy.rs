@@ -145,7 +145,7 @@ pub(super) fn show(app: &mut App, ui: &mut Ui) {
     }
     egui::Panel::top("easy-top").frame(egui::Frame::new().fill(C::bar()).inner_margin(egui::Margin::symmetric(24, 12))).show(ui, |ui| {
         if app.no_umu {
-            ui.colored_label(C::err(), "umu-launcher is not installed, so nothing can be installed or played: sudo pacman -S umu-launcher");
+            ui.colored_label(C::err(), format!("umu-launcher is not installed, so nothing can be installed or played: {}", crate::install_hint("umu-run")));
         }
         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
             ui.set_min_height(36.0); // the title sits on the buttons' centre line
@@ -264,26 +264,26 @@ fn global_settings(app: &mut App, ui: &mut Ui) {
         egui::Grid::new("reqs").num_columns(3).spacing([18.0, 8.0]).show(ui, |ui| {
             // looked up every 5 s, not every frame: a tool installed while the app is open shows up
             static FOUND: std::sync::Mutex<Option<(std::time::Instant, Vec<bool>)>> = std::sync::Mutex::new(None);
-            const TOOLS: [(&str, &str, &str); 7] = [
-                ("umu-run", "umu-launcher", "needed: runs every game and installer"),
-                ("winetricks", "winetricks", "prefix tools and missing runtimes"),
-                ("7z", "7zip", "update archives (.rar, .7z, .zip)"),
-                ("notify-send", "libnotify", "a notification when a long job ends"),
-                ("mangohud", "mangohud", "the MangoHud switch"),
-                ("gamemoderun", "gamemode", "the GameMode switch"),
-                ("gamescope", "gamescope", "the Gamescope switch"),
+            const TOOLS: [(&str, &str); 7] = [
+                ("umu-run", "needed: runs every game and installer"),
+                ("winetricks", "prefix tools and missing runtimes"),
+                ("7z", "update archives (.rar, .7z, .zip)"),
+                ("notify-send", "a notification when a long job ends"),
+                ("mangohud", "the MangoHud switch"),
+                ("gamemoderun", "the GameMode switch"),
+                ("gamescope", "the Gamescope switch"),
             ];
             let mut cache = FOUND.lock().unwrap_or_else(|e| e.into_inner());
             if cache.as_ref().is_none_or(|(t, _)| t.elapsed().as_secs() >= 5) {
-                *cache = Some((std::time::Instant::now(), TOOLS.iter().map(|(b, _, _)| crate::which_path(b).is_some()).collect()));
+                *cache = Some((std::time::Instant::now(), TOOLS.iter().map(|(b, _)| crate::which_path(b).is_some()).collect()));
             }
             let found = cache.as_ref().map(|(_, f)| f.clone()).unwrap_or_default();
-            for ((bin, pkg, what), found) in TOOLS.iter().zip(&found) {
+            for ((bin, what), found) in TOOLS.iter().zip(&found) {
                 ui.label(*bin);
                 if *found {
                     ui.label(RichText::new("installed").color(C::play()));
                 } else {
-                    ui.label(RichText::new(format!("missing: sudo pacman -S {pkg}")).color(if *bin == "umu-run" { C::err() } else { C::accent() }));
+                    ui.label(RichText::new(format!("missing: {}", crate::install_hint(bin))).color(if *bin == "umu-run" { C::err() } else { C::accent() }));
                 }
                 ui.label(RichText::new(*what).color(C::sub()).small());
                 ui.end_row();
@@ -956,16 +956,16 @@ fn page(app: &mut App, ui: &mut Ui, i: usize) {
                 Primary::SetUpEmulator => ("SET UP EMULATOR", C::install()),
             };
             let why = match primary {
-                _ if app.no_umu && needs_umu && !matches!(primary, Primary::SetUpEmulator) => Some("umu-launcher is not installed: sudo pacman -S umu-launcher"),
-                Primary::Install { .. } | Primary::SetUpPrefix if queued => Some("already queued: it starts when the running job is done"),
-                Primary::Install { space: false } => Some("not enough disk space"),
-                Primary::Install { .. } if !g.repack_dir.is_dir() => Some("no repack to install from (its folder is gone)"),
-                Primary::Play if starting => Some("starting…"),
+                _ if app.no_umu && needs_umu && !matches!(primary, Primary::SetUpEmulator) => Some(format!("umu-launcher is not installed: {}", crate::install_hint("umu-run"))),
+                Primary::Install { .. } | Primary::SetUpPrefix if queued => Some("already queued: it starts when the running job is done".into()),
+                Primary::Install { space: false } => Some("not enough disk space".into()),
+                Primary::Install { .. } if !g.repack_dir.is_dir() => Some("no repack to install from (its folder is gone)".into()),
+                Primary::Play if starting => Some("starting…".into()),
                 _ => None,
             };
             let b = egui::Button::new(RichText::new(label).size(26.0).strong().color(C::on_button())).fill(color).min_size(vec2(260.0, 64.0)).corner_radius(6);
             let r = ui.add_enabled(why.is_none(), b);
-            let r = match why {
+            let r = match &why {
                 Some(w) => r.on_disabled_hover_text(w),
                 None => r,
             };
@@ -1056,7 +1056,7 @@ fn page(app: &mut App, ui: &mut Ui, i: usize) {
                 crate::Fix::Proton(p) => format!("Use {}", Path::new(p).file_name().map_or(p.clone(), |n| n.to_string_lossy().into_owned())),
             };
             let winetricks = matches!(fix, crate::Fix::Winetricks(_));
-            if ui.add_enabled(!app.busy_with(&g) && !(winetricks && app.no_winetricks), egui::Button::new(label)).on_disabled_hover_text("winetricks is not installed: sudo pacman -S winetricks").clicked() {
+            if ui.add_enabled(!app.busy_with(&g) && !(winetricks && app.no_winetricks), egui::Button::new(label)).on_disabled_hover_text(format!("winetricks is not installed: {}", crate::install_hint("winetricks"))).clicked() {
                 app.fix = None;
                 match fix {
                     crate::Fix::Winetricks(v) => app.spawn(ui.ctx(), g.clone(), Job::Winetricks(vec![v.to_string()])),

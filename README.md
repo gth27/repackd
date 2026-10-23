@@ -5,36 +5,81 @@ Install and play game repacks on Linux with Proton.
 > **Note**
 > repackd is in early development. Expect bugs and changing behaviour. Back up your saves. To report an issue, include the output of "Copy diagnostics" (in a game's settings).
 
-repackd is a desktop app for Arch-based Linux, written in Rust with egui. It installs game repacks you already have (setup.exe-style installers such as the FitGirl format) into a separate Wine prefix per game, using umu-launcher and GE-Proton, and then launches them. Console games run through emulators you set up yourself.
+repackd is a desktop app for Linux, written in Rust with egui. It installs game repacks you already have (setup.exe-style installers such as the FitGirl format) into a separate Wine prefix per game, using umu-launcher and GE-Proton, and then launches them. Console games run through emulators you set up yourself.
+
+Tested on Arch-based systems; builds and passes its tests on Debian 13 and Fedora 42. Other distributions should work but are untested.
 
 repackd does not download games, torrents or updates. It only works with files you already have on your disk. Use it only with games you are entitled to use.
 
 ## Requirements
 
-Required: `umu-launcher`, `curl`, `gcc-libs`, `glibc`, `libglvnd`, `libxkbcommon`, `systemd-libs`, `xdg-utils`. Building needs `cargo`.
+- `umu-launcher` (required, runs the games)
+- `curl`
+- A Vulkan-capable GPU driver
+- `xdg-desktop-portal` (the folder and file pickers) and `xdg-utils` (opening folders); desktop environments ship both
+- Rust 1.85 or newer (edition 2024), only to build. Distro-packaged Rust on Debian/Ubuntu is usually too old, so use rustup.
+- Optional: `winetricks`, `7zip`, `libnotify`, `mangohud`, `gamemode`, `gamescope`
 
-Optional: `winetricks` (prefix tools), `7zip` (scene update archives), `libnotify` (notification when a long job ends), `mangohud`, `gamemode`, `gamescope`, `xdg-desktop-portal` (file pickers), `fontconfig` (CJK game names).
-
-```
-sudo pacman -S umu-launcher curl gcc-libs glibc libglvnd libxkbcommon systemd-libs xdg-utils cargo
-sudo pacman -S --asdeps winetricks 7zip libnotify mangohud gamemode gamescope xdg-desktop-portal fontconfig
-```
+When a tool is missing, repackd detects your distribution and shows the matching install command.
 
 ## Install
 
-From a clone, build and install the package:
+### Arch-based
 
 ```
+sudo pacman -S base-devel rust umu-launcher
+sudo pacman -S --asdeps winetricks 7zip libnotify mangohud gamemode gamescope
 git clone https://github.com/gth27/repackd
 cd repackd
 makepkg -si
 ```
 
-Or build the binary only. It ends up at `target/release/repackd`:
+### Debian / Ubuntu
+
+Also applies to Mint. Get `umu-launcher` from the .deb on the [releases page](https://github.com/Open-Wine-Components/umu-launcher/releases).
 
 ```
+sudo apt install build-essential pkg-config libudev-dev curl
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+# install the umu-launcher .deb from the releases page, then optionally:
+sudo apt install winetricks 7zip libnotify-bin mangohud gamemode gamescope
+git clone https://github.com/gth27/repackd
+cd repackd
 cargo build --release
+mkdir -p ~/.local/bin ~/.local/share/applications
+cp target/release/repackd ~/.local/bin/
+cp repackd.desktop ~/.local/share/applications/
 ```
+
+### Fedora
+
+```
+sudo dnf install gcc pkgconf-pkg-config systemd-devel curl umu-launcher
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+sudo dnf install winetricks 7zip libnotify mangohud gamemode gamescope
+git clone https://github.com/gth27/repackd
+cd repackd
+cargo build --release
+mkdir -p ~/.local/bin ~/.local/share/applications
+cp target/release/repackd ~/.local/bin/
+cp repackd.desktop ~/.local/share/applications/
+```
+
+### Other distributions
+
+openSUSE build dependencies (untested): `gcc pkg-config systemd-devel`. Install `umu-launcher` from your package manager or the [releases page](https://github.com/Open-Wine-Components/umu-launcher/releases).
+
+```
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+git clone https://github.com/gth27/repackd
+cd repackd
+cargo build --release
+mkdir -p ~/.local/bin ~/.local/share/applications
+cp target/release/repackd ~/.local/bin/
+cp repackd.desktop ~/.local/share/applications/
+```
+
+The `repackd.desktop` copy is optional. Make sure `~/.local/bin` is in your `PATH`.
 
 ## Usage
 

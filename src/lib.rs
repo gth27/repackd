@@ -958,6 +958,60 @@ pub fn install_proton(rel: &ProtonRelease, dir: &Path, log: &impl Report) -> Res
     result.map(|()| log.log(format!("{} installed in {}", rel.tag, dir.display())))
 }
 
+#[derive(Debug, PartialEq)]
+enum Family {
+    Arch,
+    Debian,
+    Fedora,
+    Suse,
+    Unknown,
+}
+
+/// Distro family from os-release text: `ID` first, then each `ID_LIKE` word.
+fn distro_family(os_release: &str) -> Family {
+    let val = |key: &str| os_release.lines().find_map(|l| l.strip_prefix(key)?.strip_prefix('=')).unwrap_or("").trim_matches('"').to_owned();
+    let words = format!("{} {}", val("ID"), val("ID_LIKE"));
+    words
+        .split_whitespace()
+        .find_map(|w| match w {
+            "arch" => Some(Family::Arch),
+            "debian" | "ubuntu" => Some(Family::Debian),
+            "fedora" => Some(Family::Fedora),
+            "opensuse" | "suse" | "opensuse-leap" | "opensuse-tumbleweed" => Some(Family::Suse),
+            _ => None,
+        })
+        .unwrap_or(Family::Unknown)
+}
+
+/// The command that installs `tool` (a binary name) on this system, for error and hover texts.
+pub fn install_hint(tool: &str) -> String {
+    static FAMILY: std::sync::OnceLock<Family> = std::sync::OnceLock::new();
+    let family = FAMILY.get_or_init(|| distro_family(&std::fs::read_to_string("/etc/os-release").unwrap_or_default()));
+    install_hint_for(family, tool)
+}
+
+fn install_hint_for(family: &Family, tool: &str) -> String {
+    let pkg = match (family, tool) {
+        (Family::Debian, "umu-run") => return "get umu-launcher from github.com/Open-Wine-Components/umu-launcher/releases (.deb)".into(),
+        (Family::Suse, "umu-run") => return "get umu-launcher from github.com/Open-Wine-Components/umu-launcher/releases".into(),
+        (_, "umu-run") => "umu-launcher",
+        (_, "7z") => "7zip",
+        (Family::Debian, "notify-send") => "libnotify-bin",
+        (Family::Suse, "notify-send") => "libnotify-tools",
+        (_, "notify-send") => "libnotify",
+        (_, "gamemoderun") => "gamemode",
+        (_, t) => t, // winetricks, mangohud, gamescope
+    };
+    let cmd = match family {
+        Family::Arch => "sudo pacman -S",
+        Family::Debian => "sudo apt install",
+        Family::Fedora => "sudo dnf install",
+        Family::Suse => "sudo zypper install",
+        Family::Unknown => "install",
+    };
+    format!("{cmd} {pkg}")
+}
+
 /// `PATH` lookup: the umu-run / winetricks check at start and emulator detection.
 pub fn which_path(bin: &str) -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join(bin)).find(|p| p.is_file())
@@ -2183,6 +2237,22 @@ pub fn diagnostics(g: &Game, settings: &Settings) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn distro_hints() {
+        let cachy = distro_family("NAME=\"CachyOS Linux\"\nID=cachyos\nID_LIKE=arch\n");
+        assert_eq!(cachy, Family::Arch);
+        assert_eq!(install_hint_for(&cachy, "7z"), "sudo pacman -S 7zip");
+        let mint = distro_family("ID=linuxmint\nID_LIKE=\"ubuntu debian\"\n");
+        assert_eq!(mint, Family::Debian);
+        assert_eq!(install_hint_for(&mint, "notify-send"), "sudo apt install libnotify-bin");
+        assert!(install_hint_for(&mint, "umu-run").starts_with("get umu-launcher"));
+        let nobara = distro_family("ID=nobara\nID_LIKE=\"fedora\"\n");
+        assert_eq!(install_hint_for(&nobara, "gamemoderun"), "sudo dnf install gamemode");
+        let odd = distro_family("ID=nixos\n");
+        assert_eq!(odd, Family::Unknown);
+        assert_eq!(install_hint_for(&odd, "winetricks"), "install winetricks");
+    }
+
     fn tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("repackd-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -2354,7 +2424,9 @@ mod tests {
         let g = Game { name: "g".into(), dir: d.clone(), exe: Some(d.join("g.exe")), tweaks: vec!["gamemode".into(), "mangohud".into()], env: "MANGOHUD=0".into(), ..Default::default() };
         write_launch_script(&g, &Settings::default()).unwrap();
         let s = std::fs::read_to_string(g.launch_script()).unwrap();
-        assert!(s.contains("exec 'gamemoderun' umu-run ") && s.contains("export MANGOHUD='0'") && !s.contains("MANGOHUD='1'"), "{s}");
+        // a switch whose tool is not installed is left out, so the wrapper only shows where gamemode exists
+        let wrap = if which_path("gamemoderun").is_some() { "exec 'gamemoderun' umu-run " } else { "exec umu-run " };
+        assert!(s.contains(wrap) && s.contains("export MANGOHUD='0'") && !s.contains("MANGOHUD='1'"), "{s}");
         let (text, fix) = diagnose("0124:err:module:import_dll Library MSVCP140.dll (which is needed by L\"C:\\g.exe\") not found\n", None).unwrap();
         assert_eq!(fix, Some(Fix::Winetricks("vcrun2022")), "{text}");
         assert_eq!(diagnose("wine: Unhandled page fault on read access", Some("GE-Proton10-34")).unwrap().1, Some(Fix::Proton("GE-Proton10-34".into())));

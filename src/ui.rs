@@ -935,6 +935,11 @@ impl App {
             let src = g.game_dir.as_ref().unwrap_or(&g.repack_dir);
             ui.add(egui::Label::new(RichText::new(src.display().to_string()).color(sub)).wrap());
             ui.end_row();
+            if !imported && installed {
+                row_label(ui, "Game folder");
+                ui.add(egui::Label::new(RichText::new(g.install_dir().display().to_string()).color(sub)).wrap());
+                ui.end_row();
+            }
         });
 
         section(ui, "Launch");

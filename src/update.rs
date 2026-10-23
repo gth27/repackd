@@ -359,9 +359,18 @@ fn apply_dir(g: &Game, dir: &Path, archive: bool, verify_first: bool, backup: Op
             rels.extend(crack_dirs(dir, sc).iter().flat_map(|c| rel_files(c, false)));
         }
         let root = snapshot(g, to, rels, whole, log)?;
+        let start = SystemTime::now();
         let r = run_update(g, dir, scene, log);
         if let Some(root) = root {
-            keep_only_created(&root, &g.install_dir());
+            if r.is_err() && !changed_since(&g.install_dir(), start) {
+                // the update failed before touching the game: its undo copy (maybe the whole game) is dead weight
+                let _ = std::fs::remove_dir_all(&root);
+                if let Some(p) = root.parent() {
+                    let _ = std::fs::remove_dir(p); // the backups folder, if that was its only one
+                }
+            } else {
+                keep_only_created(&root, &g.install_dir());
+            }
         }
         return r;
     }

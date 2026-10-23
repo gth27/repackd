@@ -528,6 +528,9 @@ fn storage(app: &mut App, ui: &mut Ui) {
         ui.label(RichText::new("Storage").heading());
     });
     note_line(app, ui, None);
+    if app.busy {
+        app.job_row(ui, 460.0, 28.0); // a move or uninstall started here: its progress, speed and Cancel
+    }
     ui.add_space(12.0);
     let sel = app.storage_drive.unwrap_or(OTHER);
     let games: Vec<usize> = (0..app.lib.games.len()).filter(|&i| app.storage_bucket(&app.lib.games[i]) == sel).collect();

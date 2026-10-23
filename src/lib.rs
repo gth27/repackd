@@ -1871,7 +1871,25 @@ fn copy_links_kept(old: &Path, new: &Path, from: &Path, to: &Path, done: &mut u6
             let target = target.strip_prefix(old).map_or(target.clone(), |r| new.join(r)); // relative links never match
             std::os::unix::fs::symlink(target, &q).with_context(|| format!("link {}", q.display()))?;
         } else {
-            *done += std::fs::copy(&p, &q).with_context(|| format!("copy {}", p.display()))?; // reflinks where the filesystem can
+            let (size, base) = (e.metadata().map_or(0, |m| m.len()), *done);
+            // reflinks where the filesystem can; a big file shows progress while it copies (its copy's size, twice a second)
+            let n = if size > 64 << 20 {
+                let fin = AtomicBool::new(false);
+                std::thread::scope(|s| {
+                    s.spawn(|| {
+                        while !fin.load(Ordering::Relaxed) {
+                            std::thread::sleep(Duration::from_millis(500));
+                            log.progress(base + std::fs::metadata(&q).map_or(0, |m| m.len()).min(size), total);
+                        }
+                    });
+                    let r = std::fs::copy(&p, &q);
+                    fin.store(true, Ordering::Relaxed);
+                    r
+                })
+            } else {
+                std::fs::copy(&p, &q)
+            };
+            *done += n.with_context(|| format!("copy {}", p.display()))?;
             log.progress(*done, total);
         }
     }
@@ -1933,12 +1951,14 @@ pub fn move_game(g: &Game, to_parent: &Path, files_to: Option<&Path>, others: &[
     let mut moved_files = None;
     if let Some((src, dest)) = files {
         std::fs::create_dir_all(dest.parent().unwrap_or(&dest)).with_context(|| format!("create {}", dest.display()))?;
+        log.step(&format!("Moving {}: game files", g.name));
         relocate(&src, &dest, log)?;
         moved_files = Some(dest);
     }
     if stay {
         return Ok((new, moved_files));
     }
+    log.step(&format!("Moving {}: repackd's folder (prefix, launch script, art)", g.name));
     if let Err(e) = relocate(&g.dir, &new, log) {
         let Some(f) = moved_files else { return Err(e) };
         log.log(format!("warning: the game files moved to {}, but repackd's folder stays in {}: {e:#}", f.display(), g.dir.display()));

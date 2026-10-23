@@ -478,6 +478,9 @@ impl Game {
         // winebrowser hands URLs to the host browser (FitGirl's setup ends by opening her site), and
         // winemenubuilder copies every installer's Start-menu shortcuts and file types into the real desktop menu
         c.env("WINEDLLOVERRIDES", BASE_OVERRIDES);
+        // Proton starts Xalia (gamepad driver for Windows dialogs) when a pad is plugged in; it is no use in an
+        // installer and spams errors when the installer's helper processes exit
+        c.env("PROTON_USE_XALIA", "0");
         // Windows' "don't search the current dir" switch; some tools (Claude Code) export it and Wine honours it,
         // so FitGirl's unpacker can't start its helpers (rzw.exe, xtool.exe) and fails with Unarc error -2
         c.env_remove("NoDefaultCurrentDirectoryInExePath");

@@ -1351,6 +1351,77 @@ pub fn free_space(p: &Path) -> Option<u64> {
     (unsafe { libc::statvfs(c.as_ptr(), &mut st) } == 0).then(|| st.f_bavail as u64 * st.f_frsize as u64)
 }
 
+/// A disk the user can move a game to.
+#[derive(Clone, Debug)]
+pub struct Drive {
+    pub mount: PathBuf,
+    /// Where games go on it: the games root if that lives there, else `<mount>/Games/repackd`.
+    pub target: PathBuf,
+    pub free: u64,
+    pub writable: bool,
+    /// The mountinfo major:minor, not `st_dev`: btrfs subvolumes (/ and /home) share the former only.
+    pub dev: u64,
+}
+
+/// Disk mounts from mountinfo text as (dev, mountpoint), real disk filesystems only, user-visible places only.
+fn parse_mounts(text: &str) -> Vec<(u64, PathBuf)> {
+    const SKIP: [&str; 10] = ["/boot", "/efi", "/proc", "/sys", "/dev", "/run", "/var", "/snap", "/tmp", "/nix"];
+    const FS: [&str; 11] = ["ext4", "btrfs", "xfs", "f2fs", "bcachefs", "ntfs3", "ntfs", "ntfs-3g", "fuseblk", "exfat", "vfat"];
+    text.lines().filter_map(|l| {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        let sep = f.iter().position(|&x| x == "-")?;
+        if f.len() < 5 || !FS.contains(f.get(sep + 1)?) {
+            return None;
+        }
+        let (maj, min) = f[2].split_once(':')?;
+        let dev = libc::makedev(maj.parse().ok()?, min.parse().ok()?);
+        // spaces, tabs, newlines and backslashes come as \040-style octal escapes
+        let (mut raw, mut i) = (Vec::new(), 0);
+        let b = f[4].as_bytes();
+        while i < b.len() {
+            match (b[i], b.get(i + 1..i + 4).and_then(|o| std::str::from_utf8(o).ok()).and_then(|o| u8::from_str_radix(o, 8).ok())) {
+                (b'\\', Some(c)) => (raw.push(c), i += 4),
+                (c, _) => (raw.push(c), i += 1),
+            };
+        }
+        use std::os::unix::ffi::OsStringExt;
+        let mount = PathBuf::from(std::ffi::OsString::from_vec(raw));
+        let removable = mount.starts_with("/run/media") && mount.components().count() >= 5; // /run/media/<user>/<label>
+        let hidden = SKIP.iter().any(|s| mount.starts_with(s)) || mount.starts_with("/.snapshots");
+        (removable || !hidden).then_some((dev, mount))
+    }).collect()
+}
+
+/// One (dev, mount, target) per disk; `home` and `root` pick which mount and folder stand for theirs.
+fn pick_drives(mounts: &[(u64, PathBuf)], home: &Path, root: &Path) -> Vec<(u64, PathBuf, PathBuf)> {
+    let owner = |p: &Path| mounts.iter().filter(|(_, m)| p.starts_with(m)).max_by_key(|(_, m)| m.as_os_str().len());
+    let (home_m, root_dev) = (owner(home), owner(root).map(|m| m.0));
+    let mut out: Vec<(u64, PathBuf, PathBuf)> = vec![];
+    for (dev, m) in mounts {
+        if out.iter().any(|d| d.0 == *dev) {
+            continue;
+        }
+        // btrfs lists / and /home as separate mounts of one disk: $HOME's disk is shown as the mount holding $HOME
+        let m = home_m.filter(|h| h.0 == *dev).map_or(m, |h| &h.1);
+        let target = if root_dev == Some(*dev) { root.to_path_buf() } else if home_m.is_some_and(|h| h.0 == *dev) { home.join("Games/repackd") } else { m.join("Games/repackd") };
+        out.push((*dev, m.clone(), target));
+    }
+    let home_dev = home_m.map(|h| h.0);
+    out.sort_by(|a, b| (Some(a.0) != home_dev, &a.1).cmp(&(Some(b.0) != home_dev, &b.1)));
+    out
+}
+
+/// The disks a game can move to, the one holding $HOME first. `root` is the configured games root.
+pub fn drives(root: &Path) -> Vec<Drive> {
+    use std::os::unix::ffi::OsStrExt;
+    let text = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    pick_drives(&parse_mounts(&text), &home(), root).into_iter().map(|(dev, mount, target)| {
+        let writable = target.ancestors().find(|a| a.exists()).and_then(|a| std::ffi::CString::new(a.as_os_str().as_bytes()).ok())
+            .is_some_and(|c| unsafe { libc::access(c.as_ptr(), libc::W_OK) } == 0);
+        Drive { free: free_space(&mount).unwrap_or(0), mount, target, writable, dev }
+    }).collect()
+}
+
 pub fn gb(b: u64) -> String {
     format!("{:.1} GB", b as f64 / 1e9)
 }
@@ -1586,7 +1657,8 @@ pub fn move_refusal(g: &Game, to_parent: &Path) -> Result<()> {
         bail!("{} already exists: pick another folder", new.display());
     }
     // canonical on both sides: a symlinked parent can lead back into the game folder
-    let inside = to_parent.canonicalize().context("the destination folder is not reachable")?;
+    // (the drive list offers folders that don't exist yet: move_game creates them, so check the nearest existing parent)
+    let inside = to_parent.ancestors().find(|a| a.exists()).and_then(|a| a.canonicalize().ok()).context("the destination folder is not reachable")?;
     if inside.starts_with(g.dir.canonicalize().unwrap_or(g.dir.clone())) {
         bail!("the destination is inside the game's own folder");
     }
@@ -1681,6 +1753,7 @@ fn relocate(old: &Path, new: &Path, log: &impl Report) -> Result<()> {
 pub fn move_game(g: &Game, to_parent: &Path, log: &impl Report) -> Result<PathBuf> {
     move_refusal(g, to_parent)?;
     let new = to_parent.join(g.dir.file_name().context("the game folder has no name")?);
+    std::fs::create_dir_all(to_parent).with_context(|| format!("create {}", to_parent.display()))?;
     relocate(&g.dir, &new, log)?;
     if let Err(e) = std::fs::write(new.join(MOVED_MARK), b"") {
         log.log(format!("could not mark the game as moved ({e}): Delete will refuse it until the folder is back in the games root"));
@@ -2278,6 +2351,44 @@ pub fn diagnostics(g: &Game, settings: &Settings) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const MOUNTS: &str = "\
+41 1 0:35 /@ / rw,noatime - btrfs /dev/nvme0n1p2 rw,subvol=/@
+56 41 0:35 /@home /home rw,noatime - btrfs /dev/nvme0n1p2 rw,subvol=/@home
+60 41 8:17 / /mnt/data rw,relatime - ext4 /dev/sdb1 rw
+61 41 8:18 / /mnt/my\\040disk rw,relatime - ext4 /dev/sdb2 rw
+221 41 259:3 / /boot rw,relatime - vfat /dev/nvme0n1p1 rw
+66 41 0:54 / /tmp rw,noatime - tmpfs tmpfs rw
+70 41 0:60 / /run/media/u/WIN rw,nosuid - fuseblk /dev/sdc1 rw
+71 41 0:61 / /run/user/1000 rw - tmpfs tmpfs rw
+72 41 0:98 / /var/lib/docker/x rw - overlay overlay rw,lowerdir=/a
+";
+
+    #[test]
+    fn drives_from_mountinfo() {
+        let m = parse_mounts(MOUNTS);
+        let names: Vec<_> = m.iter().map(|(_, p)| p.to_str().unwrap()).collect();
+        assert_eq!(names, ["/", "/home", "/mnt/data", "/mnt/my disk", "/run/media/u/WIN"]);
+        let d = pick_drives(&m, Path::new("/home/u"), Path::new("/mnt/data/Games/repackd"));
+        let got: Vec<_> = d.iter().map(|(_, m, t)| (m.to_str().unwrap(), t.to_str().unwrap())).collect();
+        assert_eq!(got, [
+            ("/home", "/home/u/Games/repackd"),
+            ("/mnt/data", "/mnt/data/Games/repackd"),
+            ("/mnt/my disk", "/mnt/my disk/Games/repackd"),
+            ("/run/media/u/WIN", "/run/media/u/WIN/Games/repackd"),
+        ]);
+        // a root on the home disk is the home target
+        let d = pick_drives(&m, Path::new("/home/u"), Path::new("/home/u/g"));
+        assert_eq!(d[0].2, Path::new("/home/u/g"));
+    }
+
+    #[test]
+    #[ignore]
+    fn show_drives() {
+        for d in drives(&games_root()) {
+            println!("{d:?}");
+        }
+    }
 
     #[test]
     fn distro_hints() {

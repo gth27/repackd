@@ -226,6 +226,9 @@ pub struct App {
     confirm_repack: bool,
     /// "Move to another folder" waiting for its confirmation: the picked folder.
     confirm_move: Option<PathBuf>,
+    /// The "Move…" drive list is open, with the drives read when it opened (not per frame).
+    move_pick: bool,
+    move_drives: Vec<crate::Drive>,
     disk: Option<(PathBuf, [u64; 4])>,
     /// Gamepad input, started with the first frame (None: not started, or no gamepad support).
     pad: Option<pad::Gamepad>,
@@ -324,6 +327,8 @@ impl App {
             search: String::new(),
             confirm_repack: false,
             confirm_move: None,
+            move_pick: false,
+            move_drives: vec![],
             disk: None,
             pad: None,
             name_was: None,
@@ -509,6 +514,7 @@ impl App {
         self.confirm_restore = None;
         self.confirm_repack = false;
         self.confirm_move = None;
+        self.move_pick = false;
         self.pending = Ok(vec![]);
         self.exes = None;
         self.store_text = i.and_then(|i| self.lib.games.get(i)).and_then(|g| g.store_id).map(|n| n.to_string()).unwrap_or_default();
@@ -525,6 +531,7 @@ impl App {
         self.confirm_delete = false;
         self.confirm_restore = None;
         self.confirm_move = None;
+        self.move_pick = false;
     }
 
     fn poll(&mut self) {
@@ -1374,15 +1381,46 @@ impl App {
                     });
                 }
             }
-            if ui.add_enabled(self.confirm_move.is_none() && !self.busy_with(&g) && !self.queued(&g), egui::Button::new("Move to another folder…")).on_hover_text("moves repackd's folder for this game (prefix, launch script, artwork, shader cache) to another disk or folder").clicked()
-                && let Some(to) = rfd::FileDialog::new().set_title("Move into folder").pick_folder()
-            {
-                match crate::move_refusal(&g, &to) {
-                    Ok(()) => self.confirm_move = Some(to),
-                    Err(e) => self.say(format!("error: cannot move {}: {e:#}", g.name)),
+            if ui.add_enabled(self.confirm_move.is_none() && !self.busy_with(&g) && !self.queued(&g), egui::Button::new("Move…")).on_hover_text("moves repackd's folder for this game (prefix, launch script, artwork, shader cache) to another disk").clicked() {
+                self.move_pick = !self.move_pick;
+                if self.move_pick {
+                    self.move_drives = crate::drives(&self.settings.root());
                 }
             }
         });
+        if self.move_pick && self.confirm_move.is_none() {
+            // only a size already measured: never computed here, on the UI thread
+            let size = self.disk_rows.get(&g.dir).map(|s| s[0] + s[1]).or_else(|| self.disk.as_ref().filter(|(d, _)| *d == g.dir).map(|(_, s)| s[0] + s[1]));
+            let here = self.move_drives.iter().filter(|d| g.dir.starts_with(&d.mount)).max_by_key(|d| d.mount.as_os_str().len()).map(|d| d.dev);
+            let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+            let mut pick = None;
+            for d in &self.move_drives {
+                let why = if here == Some(d.dev) {
+                    Some("Current drive")
+                } else if !d.writable {
+                    Some("No permission")
+                } else if size.is_some_and(|s| d.free < s + (1 << 30)) {
+                    Some("Not enough space")
+                } else {
+                    None
+                };
+                let name = if d.target.starts_with(&home) { "Home".to_string() } else { d.mount.display().to_string() };
+                let label = format!("{name}  ·  {} free{}", gb(d.free), why.map(|w| format!("  ·  {w}")).unwrap_or_default());
+                let b = ui.add_enabled(why.is_none(), egui::Button::new(label)).on_hover_text(why.map_or_else(|| d.target.display().to_string(), str::to_string));
+                if b.clicked() {
+                    pick = Some(d.target.clone());
+                }
+            }
+            if ui.small_button("Other folder…").clicked() && let Some(to) = rfd::FileDialog::new().set_title("Move into folder").pick_folder() {
+                pick = Some(to);
+            }
+            if let Some(to) = pick {
+                match crate::move_refusal(&g, &to) {
+                    Ok(()) => (self.confirm_move, self.move_pick) = (Some(to), false),
+                    Err(e) => self.say(format!("error: cannot move {}: {e:#}", g.name)),
+                }
+            }
+        }
         if installed {
             ui.horizontal(|ui| {
                 match &self.disk {
@@ -1457,7 +1495,7 @@ impl App {
             ui.label(RichText::new("These are your own files. repackd will not delete them.").color(sub));
             ui.horizontal(|ui| {
                 if windows || has_prefix {
-                    let label = if has_prefix { "Set up prefix again" } else { "Set up prefix" };
+                    let label = if has_prefix { "Redo setup" } else { "Finish setup" };
                     if ui.add_enabled(idle && !self.no_umu, egui::Button::new(label)).on_hover_text("creates the game data folder (Wine prefix) with the Windows components the game ships").clicked() {
                         self.spawn(&ctx, g.clone(), Job::Import);
                     }

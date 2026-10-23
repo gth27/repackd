@@ -2250,7 +2250,8 @@ pub fn write_launch_script(g: &Game, settings: &Settings) -> Result<()> {
     if g.kind == Kind::Windows || windows_emu {
         // per-game shader caches that repackd owns (Clear shader cache); the user's own env line for a variable wins
         let cache = g.dir.join("shadercache");
-        for (k, sub, v) in [("VKD3D_SHADER_CACHE_PATH", "vkd3d", None), ("MESA_SHADER_CACHE_DIR", "mesa", None), ("__GL_SHADER_DISK_CACHE_PATH", "nvidia", None), ("__GL_SHADER_DISK_CACHE_SKIP_CLEANUP", "", Some("1"))] {
+        // also Xalia off (a lingering Xalia keeps the prefix alive, so the game never counts as closed); the user env wins
+        for (k, sub, v) in [("VKD3D_SHADER_CACHE_PATH", "vkd3d", None), ("MESA_SHADER_CACHE_DIR", "mesa", None), ("__GL_SHADER_DISK_CACHE_PATH", "nvidia", None), ("__GL_SHADER_DISK_CACHE_SKIP_CLEANUP", "", Some("1")), ("PROTON_USE_XALIA", "", Some("0"))] {
             if env.iter().any(|(e, _)| e == k) {
                 continue;
             }
@@ -2689,7 +2690,7 @@ mod tests {
         write_launch_script(&g, &st).unwrap();
         let s = std::fs::read_to_string(g.launch_script()).unwrap();
         assert!(s.contains("export WINEDLLOVERRIDES='version=n,b;winmm=n,b;dxgi=n'\n") && s.matches("WINEDLLOVERRIDES").count() == 1, "{s}");
-        assert!(s.contains(&format!("mkdir -p '{0}/shadercache/vkd3d' && export VKD3D_SHADER_CACHE_PATH='{0}/shadercache/vkd3d'\n", d.display())) && s.contains("export __GL_SHADER_DISK_CACHE_SKIP_CLEANUP=1\n"), "{s}");
+        assert!(s.contains(&format!("mkdir -p '{0}/shadercache/vkd3d' && export VKD3D_SHADER_CACHE_PATH='{0}/shadercache/vkd3d'\n", d.display())) && s.contains("export __GL_SHADER_DISK_CACHE_SKIP_CLEANUP=1\n") && s.contains("export PROTON_USE_XALIA=0\n"), "{s}");
         g.env = "MESA_SHADER_CACHE_DIR=/mine".into(); // the user's own line wins
         write_launch_script(&g, &st).unwrap();
         let s = std::fs::read_to_string(g.launch_script()).unwrap();

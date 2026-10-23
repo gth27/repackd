@@ -1616,8 +1616,8 @@ pub fn run_inno(g: &Game, setup: &Path, unattended: bool, log: &impl Report) -> 
     let c = memory_scope(c);
     log.log(format!("running {}", setup.display()));
     let (done, killed) = (AtomicBool::new(false), AtomicBool::new(false));
-    // a walk of the whole game each time: often enough for the bar, rarely when there is no bar (updates)
-    let every = Duration::from_secs(if g.size.is_some() { 15 } else { 60 });
+    // a walk of the whole game each time: often enough for the bar (which shows GB written when the size is unknown)
+    let every = Duration::from_secs(15);
     let st = std::thread::scope(|s| {
         s.spawn(|| stall_watch(&g.install_dir(), g.size, &done, every, Duration::from_secs(300), step, log));
         s.spawn(|| closed_watch(&logf, &g.prefix(), &done, &killed, Duration::from_secs(3), Duration::from_secs(30), log));
@@ -1797,9 +1797,8 @@ fn stall_watch(dir: &Path, total: Option<u64>, done: &AtomicBool, every: Duratio
             log.step(resume); // before progress: a step resets the bar
             off = false;
         }
-        if let Some(t) = total {
-            log.progress(now.min(t), t);
-        }
+        // total 0 = size unknown (no setup header): the bar still shows what was written
+        log.progress(total.map_or(now, |t| now.min(t)), total.unwrap_or(0));
         if now != size {
             (size, since, warned) = (now, Instant::now(), false);
         } else if !warned && since.elapsed() >= stall {

@@ -786,6 +786,7 @@ fn game_tile(app: &App, ui: &Ui, rect: Rect, i: usize, cover_art: Option<&Path>,
     let busy = app.busy_with(g);
     let badge = if busy {
         Some(match app.progress {
+            Some((d, 0)) => format!("{} {}", app.job_label, crate::gb(d)),
             Some((d, t)) => format!("{} {}%", app.job_label, d * 100 / t.max(1)),
             None => format!("{}…", app.job_label),
         })

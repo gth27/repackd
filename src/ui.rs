@@ -1850,11 +1850,13 @@ impl App {
         }
         ui.label(RichText::new(format!("{step}…")).strong());
         let (f, text) = match self.progress {
+            Some((d, 0)) => (0.0, format!("{} written", gb(d))), // total unknown
             Some((d, t)) => (d as f32 / t.max(1) as f32, format!("{} of {}  ({}%)", gb(d), gb(t), d * 100 / t.max(1))),
             None => (0.0, String::new()),
         };
+        let unknown = self.progress.is_none_or(|(_, t)| t == 0);
         ui.horizontal(|ui| {
-            ui.add(egui::ProgressBar::new(f).text(text).desired_width(width).desired_height(height).animate(self.progress.is_none() && ui.input(|i| i.focused))); // animating redraws every frame
+            ui.add(egui::ProgressBar::new(f).text(text).desired_width(width).desired_height(height).animate(unknown && ui.input(|i| i.focused))); // animating redraws every frame
             // every job stops at its next file or step; Wine jobs also lose their processes
             if self.busy && self.job_label != "Deleting" && ui.add_enabled(!self.cancel.load(std::sync::atomic::Ordering::Relaxed), egui::Button::new("Cancel").min_size(egui::vec2(110.0, height))).clicked() {
                 self.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1867,8 +1869,8 @@ impl App {
             let speed = d.saturating_sub(first) as f64 / secs.max(0.001);
             if secs > 3.0 && speed > 0.0 {
                 let left = t.saturating_sub(d) as f64 / speed;
-                let left = if left < 90.0 { format!("{left:.0} s left") } else { format!("about {:.0} min left", left / 60.0) };
-                ui.label(RichText::new(format!("{:.0} MB/s  ·  {left}", speed / 1e6)).weak());
+                let left = if t == 0 { String::new() } else if left < 90.0 { format!("  ·  {left:.0} s left") } else { format!("  ·  about {:.0} min left", left / 60.0) };
+                ui.label(RichText::new(format!("{:.0} MB/s{left}", speed / 1e6)).weak());
             }
         }
         // the latest line from the job itself (setup, umu, winetricks), so "working" is never a black box

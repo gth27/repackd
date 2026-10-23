@@ -166,6 +166,9 @@ pub struct Settings {
     /// Repack folders the user waved away from the watch folder's banners.
     #[serde(default)]
     pub watch_dismissed: Vec<PathBuf>,
+    /// Where new games go (None = `games_root()`); existing games keep their dir.
+    #[serde(default)]
+    pub games_root: Option<PathBuf>,
 }
 
 fn yes() -> bool {
@@ -180,6 +183,11 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// The games root in effect: the setting, else `~/Games/repackd`.
+    pub fn root(&self) -> PathBuf {
+        self.games_root.clone().unwrap_or_else(games_root)
+    }
+
     pub fn load(path: &Path) -> Self {
         let mut s: Settings = match std::fs::read(path) {
             Ok(b) => serde_json::from_slice(&b).unwrap_or_else(|_| {
@@ -572,6 +580,9 @@ impl Library {
         for g in games.iter_mut().filter(|g| g.status == Status::Installed && g.exe.is_none()) {
             g.exe = targets(&g.install_dir(), g.kind).into_iter().next(); // installed before game files were picked up front
         }
+        for g in games.iter().filter(|g| g.dir.starts_with(&root) && g.dir.is_dir()) {
+            mark_game(&g.dir); // one-time backfill: games stay deletable after the root changes
+        }
         Ok(Self { path, root, games })
     }
 
@@ -589,6 +600,7 @@ impl Library {
             }
             dir = self.root.join(format!("{base}-{n}"));
         }
+        mark_game(&dir); // marked from birth, so a later root change cannot orphan it
         dir
     }
 
@@ -635,15 +647,26 @@ impl Library {
 
 }
 
-/// Empty file in a moved game's dir: `delete_files` accepts games outside the games root that have it.
+/// Empty file in every game dir: `delete_files` accepts games outside the games root that have it.
 const MOVED_MARK: &str = ".repackd-game";
+
+/// Write the marker into an existing game dir, or create the dir with it for a new game (best effort: a missing marker only matters after a root change).
+fn mark_game(dir: &Path) {
+    if dir.join(MOVED_MARK).is_file() {
+        return;
+    }
+    if !dir.exists() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(dir.join(MOVED_MARK), b"");
+}
 
 /// Delete a game's own dir (prefix, installed files, launch script) and its Steam shortcut, after backing up
 /// its saves; never the repack folder, and never an imported game's folder (that lives outside `dir`).
 /// Runs off the UI thread: tar and a 100 GB delete take a while.
 pub fn delete_files(root: &Path, g: &Game) -> Result<()> {
     // guard against a hand-edited library.json pointing somewhere else; checked before anything changes
-    // a moved game lives outside the root and says so with a marker (`move_game`)
+    // a game outside the root (moved, or from an old root) says so with a marker
     if !(g.dir.starts_with(root) || g.dir.join(MOVED_MARK).is_file()) || g.dir == root || g.dir.components().any(|c| c == std::path::Component::ParentDir) {
         bail!("refusing to delete {}: not inside {}", g.dir.display(), root.display());
     }
@@ -677,13 +700,35 @@ pub fn delete_files(root: &Path, g: &Game) -> Result<()> {
     Ok(())
 }
 
-/// Remove what a delete stopped half-way left behind in the games root.
-pub fn clear_trash(root: &Path) {
-    for e in std::fs::read_dir(root).into_iter().flatten().flatten() {
-        if e.file_name().to_string_lossy().starts_with(".trash-") {
-            let _ = std::fs::remove_dir_all(e.path());
+/// Remove what a delete stopped half-way left behind in the games root and beside every game (old roots).
+pub fn clear_trash(root: &Path, games: &[Game]) {
+    let mut dirs = vec![root];
+    for p in games.iter().filter_map(|g| g.dir.parent()) {
+        if !dirs.contains(&p) {
+            dirs.push(p);
         }
     }
+    for d in dirs {
+        for e in std::fs::read_dir(d).into_iter().flatten().flatten() {
+            if e.file_name().to_string_lossy().starts_with(".trash-") {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    }
+}
+
+/// Why `p` cannot be the games root: inside a game's dir or a `.trash-` folder, or not writable.
+pub fn root_refusal(p: &Path, games: &[Game]) -> Result<()> {
+    let p = p.canonicalize().unwrap_or_else(|_| lexical(p));
+    let canon = |d: &Path| d.canonicalize().unwrap_or_else(|_| d.to_path_buf());
+    if games.iter().any(|g| p.starts_with(canon(&g.dir))) || p.components().any(|c| c.as_os_str().to_string_lossy().starts_with(".trash-")) {
+        bail!("{} is inside a game's folder or a trash folder: pick another", p.display());
+    }
+    std::fs::create_dir_all(&p).with_context(|| format!("cannot create {}", p.display()))?;
+    let probe = p.join(format!(".repackd-probe-{}", std::process::id()));
+    std::fs::write(&probe, b"").with_context(|| format!("{} is not writable", p.display()))?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
 }
 
 /// The version FitGirl's setup leaves in the game folder as the name of its checksum list ("v1.5.1.blake3").
@@ -1176,7 +1221,7 @@ pub(crate) fn setup_header(exe: &[u8]) -> Option<Vec<u8>> {
         raw.extend_from_slice(data);
         p += 4 + n;
     }
-    let opts = lzma_rs::decompress::Options { unpacked_size: lzma_rs::decompress::UnpackedSize::UseProvided(None), ..Default::default() };
+    let opts = lzma_rs::decompress::Options { unpacked_size: lzma_rs::decompress::UnpackedSize::UseProvided(None), memlimit: Some(64 << 20), ..Default::default() };
     // a crafted header must not expand to gigabytes (it is read when a repack is added and at start)
     struct Capped(Vec<u8>);
     impl std::io::Write for Capped {
@@ -2192,6 +2237,38 @@ mod tests {
         let part = d.join("part");
         assert!(copy_move(&old, &part, &Stop).is_err()); // cancelled
         assert!(!part.exists() && old.join("f").is_file());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn custom_root_and_old_root_games() {
+        let d = tmp("customroot");
+        let (old, new) = (d.join("old"), d.join("new"));
+        let mut lib = Library::load(d.join("lib.json"), old.clone()).unwrap();
+        let (a, b) = (d.join("rp-a"), d.join("rp-b"));
+        for r in [&a, &b] {
+            std::fs::create_dir_all(r).unwrap();
+            std::fs::write(r.join("setup.exe"), b"MZ").unwrap();
+        }
+        let i = lib.add(a).unwrap();
+        let first = lib.games[i].dir.clone();
+        assert!(first.starts_with(&old) && first.join(MOVED_MARK).is_file());
+        lib.root = new.clone(); // root switched: the old game keeps its dir
+        let j = lib.add(b).unwrap();
+        assert!(lib.games[j].dir.starts_with(&new) && lib.games[i].dir == first);
+        std::fs::create_dir_all(old.join(".trash-left")).unwrap();
+        clear_trash(&lib.root, &lib.games);
+        assert!(!old.join(".trash-left").exists());
+        lib.delete(i).unwrap();
+        assert!(!first.exists() && !old.join(".trash-rp-a").exists());
+        // a refused root: inside a game, or under a trash folder
+        assert!(root_refusal(&lib.games[0].dir.join("sub"), &lib.games).is_err());
+        assert!(root_refusal(&d.join("x/.trash-y/z"), &[]).is_err());
+        assert!(root_refusal(&d.join("fresh"), &lib.games).is_ok() && d.join("fresh").is_dir());
+        // an unmarked folder outside the root is still refused
+        let out = d.join("elsewhere/g");
+        std::fs::create_dir_all(&out).unwrap();
+        assert!(delete_files(&new, &Game { name: "g".into(), dir: out.clone(), ..Default::default() }).is_err() && out.is_dir());
         let _ = std::fs::remove_dir_all(&d);
     }
 

@@ -9,7 +9,7 @@ fn main() -> Result<()> {
         rfd::MessageDialog::new().set_title("repackd").set_description("repackd is already open.").show();
         return Ok(());
     }
-    let lib = match repackd::Library::load(repackd::data_file(), repackd::games_root()) {
+    let lib = match repackd::Library::load(repackd::data_file(), repackd::Settings::load(&repackd::settings_file()).root()) {
         Ok(l) => l,
         Err(e) => {
             // started from the desktop menu nobody sees stderr; the file is left as it is so nothing is lost

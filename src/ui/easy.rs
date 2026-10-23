@@ -315,6 +315,29 @@ fn global_settings(app: &mut App, ui: &mut Ui) {
             app.save_settings();
         }
 
+        section(ui, "Games folder");
+        ui.label(RichText::new("New games go here. Existing games stay where they are; use Move in a game's settings to move one.").color(C::sub()));
+        ui.horizontal(|ui| {
+            ui.label(app.lib.root.display().to_string());
+            if ui.button("Choose…").clicked()
+                && let Some(d) = rfd::FileDialog::new().set_title("Folder new games are installed into").pick_folder()
+            {
+                match crate::root_refusal(&d, &app.lib.games) {
+                    Ok(()) => {
+                        app.lib.root = d.clone();
+                        app.settings.games_root = Some(d);
+                        app.save_settings();
+                    }
+                    Err(e) => app.notify(None, format!("{e:#}"), true),
+                }
+            }
+            if ui.add_enabled(app.settings.games_root.is_some(), egui::Button::new("Default")).clicked() {
+                app.settings.games_root = None;
+                app.lib.root = app.settings.root();
+                app.save_settings();
+            }
+        });
+
         section(ui, "Watch folder");
         ui.label(RichText::new("Download repacks here with your own client; a finished one is offered for adding.").color(C::sub()));
         ui.horizontal(|ui| {

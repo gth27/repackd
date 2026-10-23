@@ -362,8 +362,8 @@ impl App {
         });
         app.fetch_missing_covers();
         app.find_updates(app.lib.games.clone());
-        let root = app.lib.root.clone();
-        std::thread::spawn(move || crate::clear_trash(&root));
+        let (root, games) = (app.lib.root.clone(), app.lib.games.clone());
+        std::thread::spawn(move || crate::clear_trash(&root, &games));
         app.select(app.sel);
         app
     }
